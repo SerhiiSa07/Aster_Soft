@@ -3,24 +3,26 @@ EXCHANGE = {
     # HIBACHI-CHANGE: configure one or more Hibachi REST endpoints.
     # If several URLs are provided the bot will try them in sequence on network errors.
     "base_urls": [
-        "https://fapi.hibachi.finance",
-        "https://api.hibachi.finance",
-        "https://hibachi.finance",
-        # {"url": "https://203.0.113.10", "host": "fapi.hibachi.finance", "verify_ssl": False},
+        "https://api.hibachi.xyz",
+        "https://hibachi.xyz",
+        "https://www.hibachi.xyz",
+        # {"url": "https://203.0.113.10", "host": "api.hibachi.xyz", "verify_ssl": False},
         # ↑ HIBACHI-CHANGE: добавьте реальные IP-адреса Hibachi, если DNS недоступен.
     ],
     # The first URL in ``base_urls`` is also exposed as ``base_url`` for backward compatibility.
-    "base_url": "https://fapi.hibachi.finance",
-    "origin": "https://www.hibachi.finance",
-    "referer": "https://www.hibachi.finance/",
-    "api_key_header": "X-MBX-APIKEY",
-    "account_header": "X-ACCOUNT-ID",
+    "base_url": "https://api.hibachi.xyz",
+    "origin": "https://hibachi.xyz",
+    "referer": "https://hibachi.xyz/",
+    "api_key_header": "Authorization",
+    # Для REST-запросов Hibachi accountId передается как query-параметр, поэтому
+    # отдельный заголовок не нужен.
+    "account_header": None,
     "extra_headers": {
         "X-EXCHANGE": "hibachi",
     },
     # HIBACHI-CHANGE: автоматически добавляем поддомены для нескольких публичных зон Hibachi.
     "fallback_domains": [
-        "hibachi.finance",
+        "hibachi.xyz",
         "hibachi.exchange",
     ],
     # HIBACHI-CHANGE: используем публичные DNS-серверы, если локальный резолвер не справляется.

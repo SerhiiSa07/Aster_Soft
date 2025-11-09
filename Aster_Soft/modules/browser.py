@@ -32,16 +32,16 @@ DEFAULT_PROFILES = {
         "api_key_header": "X-MBX-APIKEY",
     },
     "hibachi": {
-        "base_urls": ["https://fapi.hibachi.finance"],
-        "base_url": "https://fapi.hibachi.finance",
-        "origin": "https://www.hibachi.finance",
-        "referer": "https://www.hibachi.finance/",
-        "api_key_header": "X-MBX-APIKEY",
-        # Most Hibachi deployments expect the explicit account id header
-        "account_header": "X-ACCOUNT-ID",
+        "base_urls": ["https://api.hibachi.xyz", "https://hibachi.xyz", "https://www.hibachi.xyz"],
+        "base_url": "https://api.hibachi.xyz",
+        "origin": "https://hibachi.xyz",
+        "referer": "https://hibachi.xyz/",
+        "api_key_header": "Authorization",
+        # Hibachi передает accountId как query-параметр, поэтому отдельный заголовок не обязателен.
+        "account_header": None,
         # HIBACHI-CHANGE: common public domains to try if DNS is missing records.
         "fallback_domains": [
-            "hibachi.finance",
+            "hibachi.xyz",
             "hibachi.exchange",
         ],
         # HIBACHI-CHANGE: use public DNS servers by default to avoid local resolver issues.
@@ -188,7 +188,7 @@ def _normalize_base_hosts(config: dict) -> list[RestHost]:
             unique.append(host)
 
     if not unique:
-        return [RestHost(url="https://fapi.hibachi.finance")]
+        return [RestHost(url="https://api.hibachi.xyz")]
 
     return unique
 
