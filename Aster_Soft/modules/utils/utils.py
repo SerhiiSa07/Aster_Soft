@@ -187,6 +187,8 @@ def parse_api_key(raw_key: str, default_label: str) -> ParsedAPIKey:
     account_id: Optional[str] = None
     if len(credential_parts) > 2:
         account_id_segments = list(numeric_prefix)
+        if account_id_segments and account_id_segments[-1] == credential_parts[0]:
+            account_id_segments = account_id_segments[:-1]
         account_id_segments.append(credential_parts[0])
         account_id = ":".join(account_id_segments)
 
