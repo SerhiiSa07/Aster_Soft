@@ -332,6 +332,9 @@ class AsterClient:
             "positionSide": "BOTH",
             "type": order_type,
             "quantity": token_amount,
+            "token_metadata": self.TOKENS_DATA.get(token, {}),
+            "token_name": token,
+            "expected_price": float(token_price),
         }
         if order_type == "LIMIT":
             if not price:
@@ -345,6 +348,7 @@ class AsterClient:
                 "price": float(round_cut(price, self.TOKENS_DATA[token]["price"])),
                 "timeInForce": "GTC",
             })
+            order_data["expected_price"] = order_data["price"]
 
         elif order_type == "MARKET":
             order_data.update({

@@ -6,10 +6,15 @@ try:  # HIBACHI-CHANGE: support custom DNS resolvers when aiohttp exposes them.
 except Exception:  # pragma: no cover - AsyncResolver is optional in some aiohttp builds.
     AsyncResolver = None
 _resolver_warning_logged = False  # HIBACHI-CHANGE: avoid spamming warnings when aiodns is missing.
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from loguru import logger
+from time import time
+import hashlib
 import random
+import hmac
 import asyncio
+
+from eth_account import Account
 
 # Імпортуємо налаштування
 from settings import (
@@ -299,6 +304,9 @@ class Browser:
 
         self._base_headers = self._build_base_headers()
         self.session = self.get_new_session()
+        self._contracts_by_symbol: dict[str, dict] = {}
+        self._fee_config: dict = {}
+        self._tokens_cache: list[dict] | None = None
 
     def _build_base_headers(self) -> dict[str, str]:
         headers = {
@@ -321,6 +329,99 @@ class Browser:
         if connector is not None:
             return ClientSession(headers=self._base_headers, trust_env=True, connector=connector)
         return ClientSession(headers=self._base_headers, trust_env=True)
+
+    @staticmethod
+    def _normalize_symbol(symbol: str | None) -> str:
+        if not symbol:
+            return ""
+        cleaned = symbol.strip().upper()
+        if not cleaned:
+            return ""
+        if cleaned.endswith("USDT-P"):
+            if "/" not in cleaned:
+                base = cleaned[:-7]
+                return f"{base}/USDT-P"
+            return cleaned
+        if cleaned.endswith("USDT"):
+            base = cleaned[:-4]
+            return f"{base}/USDT-P"
+        if "/" not in cleaned:
+            return f"{cleaned}/USDT-P"
+        return cleaned
+
+    @staticmethod
+    def _token_from_symbol(symbol: str | None) -> str:
+        normalized = Browser._normalize_symbol(symbol)
+        if not normalized:
+            return ""
+        if normalized.endswith("/USDT-P"):
+            return normalized[:-8]
+        if normalized.endswith("/USDT"):
+            return normalized[:-6]
+        return normalized
+
+    @staticmethod
+    def _decimal_precision_from_step(step: str | None) -> int:
+        if not step:
+            return 0
+        step = step.strip()
+        if not step or step == "1":
+            return 0
+        if "." not in step:
+            return 0
+        decimals = step.split(".")[1]
+        return len(decimals.rstrip("0"))
+
+    @staticmethod
+    def _quantize_decimal(value: Decimal, precision: int) -> Decimal:
+        if precision <= 0:
+            return value.to_integral_value(rounding=ROUND_DOWN)
+        exp = Decimal(1).scaleb(-precision)
+        return value.quantize(exp, rounding=ROUND_DOWN)
+
+    @staticmethod
+    def _format_decimal(value: Decimal, precision: int) -> str:
+        quantized = Browser._quantize_decimal(value, precision)
+        if precision <= 0:
+            return str(int(quantized))
+        return f"{quantized:.{precision}f}".rstrip("0").rstrip(".")
+
+    @staticmethod
+    def _pack_uint(value: int, length: int) -> bytes:
+        if value < 0:
+            raise ValueError("Value for signing must be non-negative")
+        return int(value).to_bytes(length, "big", signed=False)
+
+    def _sign_payload(self, payload: bytes) -> str:
+        if not payload:
+            raise ValueError("Payload for signing cannot be empty")
+        if isinstance(self.api_secret_raw, str) and self.api_secret_raw.startswith("0x"):
+            digest = hashlib.sha256(payload).digest()
+            signed = Account.sign_hash(digest, private_key=self.api_secret_raw)
+            signature_bytes = (
+                int(signed.r).to_bytes(32, "big")
+                + int(signed.s).to_bytes(32, "big")
+                + bytes([signed.v - 27])
+            )
+            return signature_bytes.hex()
+        return hmac.new(self.api_secret_bytes, payload, hashlib.sha256).hexdigest()
+
+    def _account_id(self) -> str | None:
+        return self.account_id_value or self.account_reference
+
+    async def _ensure_tokens_cached(self) -> None:
+        if self._tokens_cache is not None and self._contracts_by_symbol:
+            return
+        await self.get_tokens_data()
+
+    def _lookup_contract(self, symbol: str | None) -> dict | None:
+        normalized = self._normalize_symbol(symbol)
+        if not normalized:
+            return None
+        return self._contracts_by_symbol.get(normalized)
+
+    def _generate_nonce(self) -> int:
+        return int(time() * 1_000_000)
 
     def _build_connector(self) -> TCPConnector | None:
         """HIBACHI-CHANGE: configure custom DNS servers for aiohttp if provided."""
@@ -465,7 +566,7 @@ class Browser:
                 else:
                     params = kwargs.get("params")
 
-                if endpoint in {"balance", "account", "position_risk", "open_orders"} and self.account_id_value:
+                if endpoint in {"balance", "account", "position_risk", "open_orders", "order"} and self.account_id_value:
                     params = kwargs.setdefault("params", {})
                     params.setdefault("accountId", self.account_id_value)
 
@@ -521,17 +622,139 @@ class Browser:
                 raise e
 
     async def get_tokens_data(self):
+        if self._tokens_cache is not None:
+            return self._tokens_cache
         response = await self.send_request(
             method="GET",
             endpoint="exchange_info",
         )
         contracts = response.get("futureContracts")
-        if contracts is None:
+        if not isinstance(contracts, list):
             raise Exception(f'Failed to get tokens data: {response}')
+        self._fee_config = response.get("feeConfig") or {}
+        self._contracts_by_symbol.clear()
+        for contract in contracts:
+            symbol = contract.get("symbol")
+            normalized = self._normalize_symbol(symbol)
+            if not normalized:
+                continue
+            self._contracts_by_symbol[normalized] = contract
+            base_token = self._token_from_symbol(symbol)
+            if base_token:
+                self._contracts_by_symbol[base_token] = contract
+                self._contracts_by_symbol[f"{base_token}USDT"] = contract
+                self._contracts_by_symbol[f"{base_token}/USDT-P"] = contract
+        self._tokens_cache = contracts
         return contracts
 
     async def create_order(self, order_data: dict):
-        raise NotImplementedError("Order placement requires Hibachi-specific signing and is not yet implemented")
+        await self._ensure_tokens_cached()
+
+        if not isinstance(order_data, dict):
+            raise ValueError("Order data must be a dictionary")
+
+        metadata = order_data.get("token_metadata") if isinstance(order_data.get("token_metadata"), dict) else None
+        symbol_input = order_data.get("symbol") or (metadata.get("symbol") if metadata else None)
+        normalized_symbol = self._normalize_symbol(symbol_input)
+        if not normalized_symbol:
+            raise Exception(f"Unable to determine Hibachi symbol for order: {order_data}")
+
+        contract_info = metadata or self._lookup_contract(normalized_symbol)
+        if not contract_info:
+            raise Exception(f"Contract metadata not found for symbol {normalized_symbol}")
+
+        contract_id = int(contract_info.get("contract_id") or contract_info.get("id"))
+        underlying_decimals = int(contract_info.get("underlying_decimals") or contract_info.get("underlyingDecimals") or 0)
+        settlement_decimals = int(contract_info.get("settlement_decimals") or contract_info.get("settlementDecimals") or 0)
+        size_precision = int(contract_info.get("size") or contract_info.get("size_precision") or self._decimal_precision_from_step(contract_info.get("stepSize")))
+        price_precision = int(contract_info.get("price") or contract_info.get("price_precision") or self._decimal_precision_from_step(contract_info.get("tickSize")))
+
+        quantity_value = Decimal(str(order_data.get("quantity")))
+        quantity_str = self._format_decimal(quantity_value, size_precision)
+        quantity_units = int((self._quantize_decimal(quantity_value, size_precision) * (Decimal(10) ** underlying_decimals)).to_integral_value(rounding=ROUND_HALF_UP))
+        if quantity_units <= 0:
+            raise Exception("Order quantity is below Hibachi minimum step size")
+
+        order_type = (order_data.get("type") or "MARKET").upper()
+        side_flag = (order_data.get("side") or "BUY").upper()
+        side_value = "BID" if side_flag == "BUY" else "ASK"
+        side_code = 1 if side_value == "BID" else 0
+
+        price_decimal = Decimal(str(order_data.get("price") if order_data.get("price") is not None else order_data.get("expected_price", 0)))
+        price_for_signature = price_decimal if order_type == "LIMIT" else Decimal("0")
+        price_units = int((price_for_signature * (Decimal(2) ** 32) * (Decimal(10) ** (underlying_decimals - settlement_decimals))).to_integral_value(rounding=ROUND_HALF_UP)) if price_for_signature else 0
+        if order_type == "LIMIT" and price_units <= 0:
+            raise Exception("Limit order price must be positive for Hibachi")
+
+        max_fee_rate = Decimal(str(
+            (self._fee_config or {}).get("tradeTakerFeeRate")
+            or (self._fee_config or {}).get("tradeMakerFeeRate")
+            or "0.0005"
+        ))
+        max_fee_rate = max_fee_rate.quantize(Decimal(1).scaleb(-8), rounding=ROUND_HALF_UP)
+        max_fee_units = int((max_fee_rate * (Decimal(10) ** 8)).to_integral_value(rounding=ROUND_HALF_UP))
+        max_fee_str = f"{max_fee_rate:.8f}".rstrip("0").rstrip(".") or "0"
+
+        nonce = self._generate_nonce()
+
+        payload = (
+            self._pack_uint(nonce, 8)
+            + self._pack_uint(contract_id, 4)
+            + self._pack_uint(quantity_units, 8)
+            + self._pack_uint(side_code, 4)
+            + self._pack_uint(price_units, 8)
+            + self._pack_uint(max_fee_units, 8)
+        )
+
+        signature = self._sign_payload(payload)
+
+        account_id = self._account_id()
+        if not account_id:
+            raise Exception("Account identifier is required to place orders on Hibachi")
+
+        body = {
+            "accountId": int(account_id) if str(account_id).isdigit() else account_id,
+            "symbol": normalized_symbol,
+            "nonce": nonce,
+            "side": side_value,
+            "orderType": order_type,
+            "quantity": quantity_str,
+            "maxFeesPercent": max_fee_str,
+            "signature": signature,
+        }
+
+        if order_type == "LIMIT" and order_data.get("price") is not None:
+            body["price"] = self._format_decimal(price_decimal, price_precision)
+
+        response = await self.send_request(
+            method="POST",
+            endpoint="order",
+            data=body,
+        )
+
+        order_id = response.get("orderId") or response.get("order_id")
+        if order_id is None:
+            raise Exception(f"Unexpected create order response: {response}")
+
+        token_name = order_data.get("token_name") or self._token_from_symbol(normalized_symbol)
+
+        try:
+            order_snapshot = await self.get_order_result(token_name or normalized_symbol, order_id)
+        except Exception as exc:
+            logger.opt(colors=True).warning(
+                f"[!] <white>{self.label}</white> | Failed to fetch order snapshot after placement: {exc}"
+            )
+            fallback_price = price_decimal if price_decimal is not None else Decimal(str(order_data.get("expected_price") or "0"))
+            executed_qty = quantity_value if order_type != "LIMIT" else Decimal("0")
+            order_snapshot = {
+                "orderId": order_id,
+                "status": "FILLED" if order_type == "MARKET" else "NEW",
+                "avgPrice": str(fallback_price),
+                "executedQty": str(executed_qty),
+                "cumQuote": str(fallback_price * executed_qty),
+            }
+
+        return order_snapshot
 
     async def get_balance(self):
         response = await self.send_request(
@@ -580,7 +803,9 @@ class Browser:
         return result
 
     async def change_leverage(self, token_name: str, leverage: int):
-        raise NotImplementedError("Leverage updates require Hibachi HMAC signing and are not yet implemented")
+        logger.opt(colors=True).debug(
+            f"[•] <white>{self.label}</white> | Skipping leverage update for <white>{token_name}</white> (Hibachi API not available)"
+        )
 
     async def get_account_positions(self):
         response = await self.send_request(
@@ -606,10 +831,43 @@ class Browser:
         return normalized
 
     async def get_account_orders(self):
-        raise NotImplementedError("Open orders retrieval requires Hibachi trade endpoints that demand signing")
+        response = await self.send_request(
+            method="GET",
+            endpoint="open_orders",
+        )
+        orders = response.get("orders") if isinstance(response, dict) else response
+        if orders is None:
+            return []
+        if isinstance(orders, list):
+            return orders
+        return []
 
     async def close_all_open_orders(self, token_name: str):
-        raise NotImplementedError("Cancelling orders requires Hibachi HMAC signing and nonce handling")
+        await self._ensure_tokens_cached()
+        account_id = self._account_id()
+        if not account_id:
+            raise Exception("Account identifier is required to cancel orders")
+
+        nonce = self._generate_nonce()
+        payload = self._pack_uint(nonce, 8)
+        signature = self._sign_payload(payload)
+
+        request_body = {
+            "accountId": int(account_id) if str(account_id).isdigit() else account_id,
+            "nonce": nonce,
+            "signature": signature,
+        }
+
+        if token_name:
+            contract = self._lookup_contract(token_name)
+            if contract:
+                request_body["contractId"] = int(contract.get("contract_id") or contract.get("id"))
+
+        await self.send_request(
+            method="DELETE",
+            endpoint="cancel_all",
+            data=request_body,
+        )
 
     async def get_token_order_book(self, token_name: str):
         response = await self.send_request(
@@ -629,6 +887,103 @@ class Browser:
             return float(levels[0].get("price", 0))
 
         return {"BUY": _first_price(bid), "SELL": _first_price(ask)}
+
+    async def get_order_result(self, token_name: str, order_id: int | str):
+        await self._ensure_tokens_cached()
+
+        params = {"orderId": order_id}
+        response = await self.send_request(
+            method="GET",
+            endpoint="order",
+            params=params,
+        )
+        if not isinstance(response, dict):
+            raise Exception(f"Unexpected order response: {response}")
+
+        raw_status = (response.get("status") or "").upper()
+        if raw_status in {"PLACED", "OPEN"}:
+            mapped_status = "NEW"
+        elif raw_status in {"FILLED", "EXECUTED"}:
+            mapped_status = "FILLED"
+        elif raw_status in {"CANCELLED", "CANCELED"}:
+            mapped_status = "CANCELED"
+        else:
+            mapped_status = raw_status or "UNKNOWN"
+
+        contract = self._lookup_contract(token_name)
+        size_precision = 0
+        price_precision = 0
+        if contract:
+            size_precision = int(contract.get("size") or contract.get("size_precision") or self._decimal_precision_from_step(contract.get("stepSize")))
+            price_precision = int(contract.get("price") or contract.get("price_precision") or self._decimal_precision_from_step(contract.get("tickSize")))
+
+        total_qty = Decimal(str(response.get("totalQuantity") or response.get("quantity") or response.get("origQty") or "0"))
+        available_qty = Decimal(str(response.get("availableQuantity") or response.get("leavesQuantity") or "0"))
+        executed_qty = total_qty - available_qty
+        if executed_qty < 0:
+            executed_qty = Decimal("0")
+        if mapped_status == "FILLED" and executed_qty == 0 and total_qty:
+            executed_qty = total_qty
+
+        price_field = (
+            response.get("avgPrice")
+            or response.get("price")
+            or response.get("executionPrice")
+            or response.get("lastPrice")
+            or response.get("markPrice")
+            or response.get("triggerPrice")
+            or 0
+        )
+        price_decimal = Decimal(str(price_field or "0"))
+
+        cum_quote = price_decimal * executed_qty
+
+        executed_qty_str = self._format_decimal(executed_qty, size_precision) if contract else str(executed_qty.normalize())
+        price_str = self._format_decimal(price_decimal, price_precision) if contract else str(price_decimal.normalize())
+        cum_quote_str = str(cum_quote.normalize()) if cum_quote else "0"
+
+        return {
+            "orderId": response.get("orderId") or response.get("id") or str(order_id),
+            "status": mapped_status,
+            "avgPrice": price_str,
+            "executedQty": executed_qty_str,
+            "cumQuote": cum_quote_str,
+        }
+
+    async def cancel_order(self, token_name: str, order_id: int | str):
+        await self._ensure_tokens_cached()
+        account_id = self._account_id()
+        if not account_id:
+            raise Exception("Account identifier is required to cancel a specific order")
+
+        contract = self._lookup_contract(token_name)
+        contract_id = int(contract.get("contract_id") or contract.get("id")) if contract else None
+
+        order_identifier = str(order_id)
+        try:
+            order_numeric = int(order_identifier)
+            payload = self._pack_uint(order_numeric, 8)
+            request_body = {
+                "accountId": int(account_id) if str(account_id).isdigit() else account_id,
+                "orderId": order_numeric,
+                "signature": self._sign_payload(payload),
+            }
+        except ValueError:
+            payload = order_identifier.encode("utf-8")
+            request_body = {
+                "accountId": int(account_id) if str(account_id).isdigit() else account_id,
+                "clientId": order_identifier,
+                "signature": self._sign_payload(payload),
+            }
+
+        if contract_id is not None:
+            request_body["contractId"] = contract_id
+
+        await self.send_request(
+            method="DELETE",
+            endpoint="order",
+            data=request_body,
+        )
 
 
 class TradingBot:
