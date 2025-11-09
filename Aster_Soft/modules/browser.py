@@ -88,7 +88,7 @@ class Browser:
             self.api_secret_raw,
             parsed_account_reference,
             self._parsed_credentials,
-        ) = self._extract_credentials(api_key)  # HIBACHI-CHANGE: align browser credentials with Hibachi parsing
+        ) = self._extract_credentials(api_key, account_reference)  # HIBACHI-CHANGE: align browser credentials with Hibachi parsing
         if account_reference and parsed_account_reference and account_reference != parsed_account_reference:
             logger.opt(colors=True).warning(
                 f'[!] <white>{self.label}</white> | Account reference mismatch: '
@@ -136,8 +136,20 @@ class Browser:
         if self.session:
             await self.session.close()
 
-    def _extract_credentials(self, api_key: str) -> tuple[str, str, str | None, ParsedAPIKey]:
-        parsed = parse_api_key(api_key, default_label=self.label)  # HIBACHI-CHANGE: single parsing routine
+    def _extract_credentials(
+        self,
+        api_key: str,
+        provided_account_reference: str | None = None,
+    ) -> tuple[str, str, str | None, ParsedAPIKey]:
+        if provided_account_reference:
+            normalized_reference = provided_account_reference.strip()
+            prefixed_key = api_key
+            if normalized_reference and not api_key.startswith(f"{normalized_reference}:"):
+                prefixed_key = f"{normalized_reference}:{api_key}"
+        else:
+            prefixed_key = api_key
+
+        parsed = parse_api_key(prefixed_key, default_label=self.label)  # HIBACHI-CHANGE: single parsing routine
         account_reference = parsed.account_id
         if not account_reference and len(parsed.credential_parts) > 2:
             account_reference = parsed.credential_parts[-3]
