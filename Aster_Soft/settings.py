@@ -18,6 +18,11 @@ EXCHANGE = {
     "extra_headers": {
         "X-EXCHANGE": "hibachi",
     },
+    # HIBACHI-CHANGE: автоматически добавляем поддомены для нескольких публичных зон Hibachi.
+    "fallback_domains": [
+        "hibachi.finance",
+        "hibachi.exchange",
+    ],
 }
 
 SHUFFLE_WALLETS     = True

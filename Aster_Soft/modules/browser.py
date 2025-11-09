@@ -35,6 +35,11 @@ DEFAULT_PROFILES = {
         "api_key_header": "X-MBX-APIKEY",
         # Most Hibachi deployments expect the explicit account id header
         "account_header": "X-ACCOUNT-ID",
+        # HIBACHI-CHANGE: common public domains to try if DNS is missing records.
+        "fallback_domains": [
+            "hibachi.finance",
+            "hibachi.exchange",
+        ],
     },
 }
 
@@ -151,6 +156,23 @@ def _normalize_base_hosts(config: dict) -> list[RestHost]:
                 )
             )
 
+    fallback_domains = config.get("fallback_domains") or []
+    if isinstance(fallback_domains, (list, tuple)):
+        scheme_hint = "https"
+        if hosts:
+            parsed = urlparse(hosts[0].url)
+            if parsed.scheme:
+                scheme_hint = parsed.scheme
+        for domain in fallback_domains:
+            if not isinstance(domain, str):
+                continue
+            cleaned_domain = domain.strip().lstrip(".")
+            if not cleaned_domain:
+                continue
+            primary_url = f"{scheme_hint}://fapi.{cleaned_domain}"
+            for variant in _generate_url_variants(primary_url):
+                hosts.append(RestHost(url=variant))
+
     unique: list[RestHost] = []
     seen = set()
     for host in hosts:
@@ -204,6 +226,11 @@ class Browser:
         self.base_hosts = list(self.BASE_HOSTS)
         if not self.base_hosts:
             self.base_hosts = [RestHost(url=BASE_URL)]
+        if len(self.base_hosts) > 1:
+            host_urls = ", ".join(host.url for host in self.base_hosts)
+            logger.opt(colors=True).debug(
+                f"[•] <white>{label}</white> | REST hosts rotation: <white>{host_urls}</white>"
+            )
         self._base_url_index = 0
         self.api_key = api_key
         self.label = label
@@ -262,7 +289,8 @@ class Browser:
         return headers
 
     def get_new_session(self):
-        return ClientSession(headers=self._base_headers)
+        # HIBACHI-CHANGE: trust environment variables so system-wide proxy or DNS settings apply.
+        return ClientSession(headers=self._base_headers, trust_env=True)
 
     async def close_session(self):
         if self.session:
