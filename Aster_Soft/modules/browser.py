@@ -34,8 +34,14 @@ DEFAULT_PROFILES = {
         "fallback_prefixes": ["fapi"],
     },
     "hibachi": {
-        "base_urls": ["https://api.hibachi.xyz", "https://hibachi.xyz", "https://www.hibachi.xyz"],
-        "base_url": "https://api.hibachi.xyz",
+        "base_urls": [
+            "https://fapi.hibachi.finance",
+            "https://fapi.hibachi.xyz",
+            "https://api.hibachi.xyz",
+            "https://hibachi.xyz",
+            "https://www.hibachi.xyz",
+        ],
+        "base_url": "https://fapi.hibachi.xyz",
         "origin": "https://hibachi.xyz",
         "referer": "https://hibachi.xyz/",
         "api_key_header": "Authorization",
@@ -44,6 +50,7 @@ DEFAULT_PROFILES = {
         # HIBACHI-CHANGE: common public domains to try if DNS is missing records.
         "fallback_domains": [
             "hibachi.xyz",
+            "hibachi.finance",
             "hibachi.exchange",
         ],
         "fallback_prefixes": ["api"],
@@ -95,37 +102,18 @@ def _generate_url_variants(url: str) -> list[str]:
     """Return a list of candidate REST URLs derived from the provided host."""
 
     parsed = urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
+    netloc = parsed.netloc or ""
+    if not parsed.scheme or not netloc:
         return []
 
-    variants: list[str] = []
-
-    def _add_variant(variant_url: str) -> None:
-        cleaned = variant_url.rstrip('/')
-        if cleaned and cleaned not in variants:
-            variants.append(cleaned)
-
-    _add_variant(url)
+    cleaned_url = url.rstrip('/')
+    variants: list[str] = [cleaned_url]
 
     hostname = parsed.hostname or ""
-    port_suffix = f":{parsed.port}" if parsed.port else ""
-    if hostname and "." in hostname:
-        bare_domain = hostname.split(".", 1)[1]
-        if bare_domain:
-            _add_variant(urlunparse(parsed._replace(netloc=f"{bare_domain}{port_suffix}")))
-            _add_variant(urlunparse(parsed._replace(netloc=f"www.{bare_domain}{port_suffix}")))
-
-            prefix = hostname.split(".", 1)[0]
-            alt_prefixes: list[str] = []
-            if prefix == "fapi":
-                alt_prefixes.append("api")
-            elif prefix == "api":
-                alt_prefixes.append("fapi")
-
-            for alt_prefix in alt_prefixes:
-                _add_variant(
-                    urlunparse(parsed._replace(netloc=f"{alt_prefix}.{bare_domain}{port_suffix}"))
-                )
+    if hostname and not hostname.startswith("www."):
+        www_variant = urlunparse(parsed._replace(netloc=f"www.{hostname}")).rstrip('/')
+        if www_variant not in variants:
+            variants.append(www_variant)
 
     return variants
 
@@ -197,6 +185,7 @@ def _normalize_base_hosts(config: dict) -> list[RestHost]:
             if not cleaned_domain:
                 continue
             for prefix in fallback_prefixes:
+                prefix = prefix.strip() if isinstance(prefix, str) else None
                 if prefix:
                     primary_url = f"{scheme_hint}://{prefix}.{cleaned_domain}"
                 else:
