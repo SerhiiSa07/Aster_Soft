@@ -821,11 +821,23 @@ class Browser:
             quantity = Decimal(str(position.get("quantity", "0")))
             if not quantity:
                 continue
+
+            direction = str(position.get("direction", "")).strip().lower()
+            if direction == "short":
+                signed_quantity = -quantity
+            elif direction == "long" or direction == "both":
+                signed_quantity = quantity
+            else:
+                # HIBACHI-CHANGE: fallback to signed quantity field when direction is missing.
+                signed_quantity = Decimal(str(position.get("signedQuantity", quantity)))
+                if not signed_quantity:
+                    signed_quantity = quantity
+
             symbol = position.get("symbol", "")
             normalized.append(
                 {
                     "symbol": symbol.replace("/USDT-P", "USDT"),
-                    "positionAmt": str(quantity),
+                    "positionAmt": str(signed_quantity),
                 }
             )
         return normalized
