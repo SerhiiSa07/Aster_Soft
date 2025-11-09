@@ -1,5 +1,5 @@
 from dataclasses import dataclass  # HIBACHI-CHANGE: structure REST hosts with metadata
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, urlunparse
 from aiohttp import ClientError, ClientSession, ClientConnectorError
 from decimal import Decimal
 from hashlib import sha256
@@ -77,6 +77,33 @@ def _as_bool(value, default: bool = True) -> bool:
     return default
 
 
+def _generate_url_variants(url: str) -> list[str]:
+    """Return a list of candidate REST URLs derived from the provided host."""
+
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return []
+
+    variants: list[str] = []
+
+    def _add_variant(variant_url: str) -> None:
+        cleaned = variant_url.rstrip('/')
+        if cleaned and cleaned not in variants:
+            variants.append(cleaned)
+
+    _add_variant(url)
+
+    hostname = parsed.netloc
+    if hostname.startswith("fapi."):
+        bare_domain = hostname[len("fapi."):]
+        if bare_domain:
+            _add_variant(urlunparse(parsed._replace(netloc=f"api.{bare_domain}")))
+            _add_variant(urlunparse(parsed._replace(netloc=bare_domain)))
+            _add_variant(urlunparse(parsed._replace(netloc=f"www.{bare_domain}")))
+
+    return variants
+
+
 def _normalize_base_hosts(config: dict) -> list[RestHost]:
     raw_entries: list = []
     if "base_urls" in config and isinstance(config["base_urls"], (list, tuple)):
@@ -94,7 +121,8 @@ def _normalize_base_hosts(config: dict) -> list[RestHost]:
             cleaned = entry.strip()
             if not cleaned:
                 continue
-            hosts.append(RestHost(url=cleaned.rstrip('/')))
+            for variant in _generate_url_variants(cleaned):
+                hosts.append(RestHost(url=variant))
             continue
 
         if not isinstance(entry, dict):
@@ -114,13 +142,14 @@ def _normalize_base_hosts(config: dict) -> list[RestHost]:
         if verify_ssl is None:
             verify_ssl = entry.get("ssl")
 
-        hosts.append(
-            RestHost(
-                url=cleaned_url.rstrip('/'),
-                host_header=host_header.strip() if isinstance(host_header, str) else None,
-                verify_ssl=_as_bool(verify_ssl, True),
+        for variant in _generate_url_variants(cleaned_url):
+            hosts.append(
+                RestHost(
+                    url=variant,
+                    host_header=host_header.strip() if isinstance(host_header, str) else None,
+                    verify_ssl=_as_bool(verify_ssl, True),
+                )
             )
-        )
 
     unique: list[RestHost] = []
     seen = set()

@@ -4,6 +4,8 @@ EXCHANGE = {
     # If several URLs are provided the bot will try them in sequence on network errors.
     "base_urls": [
         "https://fapi.hibachi.finance",
+        "https://api.hibachi.finance",
+        "https://hibachi.finance",
         # {"url": "https://203.0.113.10", "host": "fapi.hibachi.finance", "verify_ssl": False},
         # ↑ HIBACHI-CHANGE: добавьте реальные IP-адреса Hibachi, если DNS недоступен.
     ],
