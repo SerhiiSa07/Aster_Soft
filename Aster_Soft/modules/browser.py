@@ -1,5 +1,5 @@
 from dataclasses import dataclass  # HIBACHI-CHANGE: structure REST hosts with metadata
-from urllib.parse import urlencode, urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse
 from aiohttp import ClientError, ClientSession, ClientConnectorError, TCPConnector
 try:  # HIBACHI-CHANGE: support custom DNS resolvers when aiohttp exposes them.
     from aiohttp.resolver import AsyncResolver
@@ -7,10 +7,7 @@ except Exception:  # pragma: no cover - AsyncResolver is optional in some aiohtt
     AsyncResolver = None
 _resolver_warning_logged = False  # HIBACHI-CHANGE: avoid spamming warnings when aiodns is missing.
 from decimal import Decimal
-from hashlib import sha256
 from loguru import logger
-from time import time
-import hmac
 import random
 import asyncio
 
@@ -35,13 +32,11 @@ DEFAULT_PROFILES = {
     },
     "hibachi": {
         "base_urls": [
-            "https://fapi.hibachi.finance",
-            "https://fapi.hibachi.xyz",
             "https://api.hibachi.xyz",
             "https://hibachi.xyz",
             "https://www.hibachi.xyz",
         ],
-        "base_url": "https://fapi.hibachi.xyz",
+        "base_url": "https://api.hibachi.xyz",
         "origin": "https://hibachi.xyz",
         "referer": "https://hibachi.xyz/",
         "api_key_header": "Authorization",
@@ -53,9 +48,11 @@ DEFAULT_PROFILES = {
             "hibachi.finance",
             "hibachi.exchange",
         ],
-        "fallback_prefixes": ["api"],
+        "fallback_prefixes": ["api", None],
         # HIBACHI-CHANGE: use public DNS servers by default to avoid local resolver issues.
         "dns_servers": ["1.1.1.1", "8.8.8.8"],
+        # HIBACHI-CHANGE: separate host for public market data endpoints.
+        "data_base_url": "https://data-api.hibachi.xyz",
     },
 }
 
@@ -209,6 +206,7 @@ def _normalize_base_hosts(config: dict) -> list[RestHost]:
 
 BASE_HOSTS = _normalize_base_hosts(EXCHANGE_CONFIG)
 BASE_URL = BASE_HOSTS[0].url
+DATA_BASE_URL = EXCHANGE_CONFIG.get("data_base_url") or DEFAULT_EXCHANGE_CONFIG.get("data_base_url") or "https://data-api.hibachi.xyz"
 ORIGIN = EXCHANGE_CONFIG.get("origin")
 REFERER = EXCHANGE_CONFIG.get("referer")
 API_KEY_HEADER_NAME = EXCHANGE_CONFIG.get("api_key_header", DEFAULT_EXCHANGE_CONFIG["api_key_header"])
@@ -217,17 +215,17 @@ EXTRA_HEADERS = EXCHANGE_CONFIG.get("extra_headers", {})
 DNS_NAMESERVERS = EXCHANGE_CONFIG.get("dns_servers")
 
 DEFAULT_ENDPOINTS = {
-    "time": "/fapi/v1/time",
-    "exchange_info": "/fapi/v1/exchangeInfo",
-    "order": "/fapi/v1/order",
-    "balance": "/fapi/v2/balance",
-    "ticker_price": "/fapi/v1/ticker/price",
-    "account": "/fapi/v4/account",
-    "leverage": "/fapi/v1/leverage",
-    "position_risk": "/fapi/v2/positionRisk",
-    "open_orders": "/fapi/v1/openOrders",
-    "cancel_all": "/fapi/v1/allOpenOrders",
-    "order_book": "/fapi/v1/depth",
+    "time": {"path": "/exchange/utc-timestamp", "base": "data"},
+    "exchange_info": {"path": "/market/exchange-info", "base": "data"},
+    "order": {"path": "/trade/order", "base": "trade"},
+    "balance": {"path": "/capital/balance", "base": "trade"},
+    "ticker_price": {"path": "/market/data/prices", "base": "data"},
+    "account": {"path": "/trade/account/info", "base": "trade"},
+    "leverage": {"path": "/trade/account/leverage", "base": "trade"},
+    "position_risk": {"path": "/trade/account/info", "base": "trade"},
+    "open_orders": {"path": "/trade/account/orders", "base": "trade"},
+    "cancel_all": {"path": "/trade/orders", "base": "trade"},
+    "order_book": {"path": "/market/data/orderbook", "base": "data"},
 }
 
 ENDPOINTS = {**DEFAULT_ENDPOINTS, **EXCHANGE_CONFIG.get("endpoints", {})}
@@ -274,6 +272,11 @@ class Browser:
         self.api_key_header_name = self.API_KEY_HEADER_NAME
         self.account_header_name = self.ACCOUNT_HEADER_NAME
         self.extra_headers = dict(EXTRA_HEADERS)
+        self.account_id_value = None
+        if self.account_reference:
+            ref_segments = [seg for seg in self.account_reference.split(":") if seg]
+            if ref_segments:
+                self.account_id_value = ref_segments[-1]
 
         if self.account_reference:
             logger.opt(colors=True).debug(
@@ -300,11 +303,14 @@ class Browser:
     def _build_base_headers(self) -> dict[str, str]:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            "Accept": "application/json",
         }
         if self.ORIGIN:
             headers["Origin"] = self.ORIGIN
         if self.REFERER:
             headers["Referer"] = self.REFERER
+        if self.API_KEY_HEADER_NAME and self.api_key_header_value:
+            headers[self.API_KEY_HEADER_NAME] = self.api_key_header_value
         if self.extra_headers:
             headers.update(self.extra_headers)
         return headers
@@ -409,32 +415,33 @@ class Browser:
             )
 
     def _build_url(self, endpoint_key: str) -> str:
-        path = self.endpoints.get(endpoint_key)
-        if path is None:
+        spec = self.endpoints.get(endpoint_key)
+        if spec is None:
             raise ValueError(f"Unknown endpoint '{endpoint_key}'")
-        return f'{self._current_host().url}{path}'
 
-    def _build_signature(self, all_params: dict, method: str):
-        query_string = urlencode(all_params)
+        base = "trade"
+        path = spec
+        if isinstance(spec, dict):
+            base = spec.get("base", "trade")
+            path = spec.get("path") or spec.get("url")
 
-        signature = hmac.new(
-            self.api_secret_bytes,
-            query_string.encode('utf-8'),
-            sha256
-        ).hexdigest()
+        if not isinstance(path, str):
+            raise ValueError(f"Endpoint '{endpoint_key}' is misconfigured: {spec}")
 
-        headers = {self.api_key_header_name: self.api_key_header_value}
-        if self.account_header_name and self.account_reference:
-            headers[self.account_header_name] = self.account_reference
-        if self.extra_headers:
-            headers.update(self.extra_headers)
+        cleaned_path = path.strip()
+        if not cleaned_path:
+            raise ValueError(f"Endpoint '{endpoint_key}' has empty path")
 
-        return {
-            "headers": headers,
-            "data" if method == "POST" else "params": {
-                "signature": signature
-            }
-        }
+        if cleaned_path.startswith("http://") or cleaned_path.startswith("https://"):
+            return cleaned_path
+
+        if not cleaned_path.startswith("/"):
+            cleaned_path = f"/{cleaned_path}"
+
+        if base == "data":
+            return f"{DATA_BASE_URL}{cleaned_path}"
+
+        return f"{self._current_host().url}{cleaned_path}"
 
     async def send_request(self, endpoint: str | None = None, **kwargs):
         for attempt in range(self.max_retries):
@@ -442,64 +449,69 @@ class Browser:
                 current_host = self._current_host()
                 if endpoint:
                     kwargs["url"] = self._build_url(endpoint)
-                if kwargs.get("method"):
-                    kwargs["method"] = kwargs["method"].upper()
+
+                method = kwargs.get("method", "GET").upper()
+                kwargs["method"] = method
+
                 if self.proxy:
                     kwargs["proxy"] = self.proxy
                 if current_host.verify_ssl is not None:
                     kwargs.setdefault("ssl", current_host.verify_ssl)
 
-                if kwargs.get("build_signature"):
-                    del kwargs["build_signature"]
+                kwargs.pop("build_signature", None)
 
-                    # Get server time first
-                    try:
-                        async with self.session.request(
-                            method="GET",
-                            url=self._build_url("time"),
-                            proxy=self.proxy
-                        ) as time_req:
-                            time_data = await time_req.json()
-                            server_time = time_data["serverTime"]
-                    except:
-                        server_time = int(time() * 1000)
+                if method == "GET":
+                    params = kwargs.setdefault("params", {})
+                else:
+                    params = kwargs.get("params")
 
-                    if kwargs.get("params") is None:
-                        kwargs["params"] = {}
-                    kwargs["params"].update({
-                        "timestamp": server_time,
-                        "recvWindow": 10000,
-                    })
+                if endpoint in {"balance", "account", "position_risk", "open_orders"} and self.account_id_value:
+                    params = kwargs.setdefault("params", {})
+                    params.setdefault("accountId", self.account_id_value)
 
-                    if kwargs["method"] == "POST":
-                        all_params = {**kwargs.get("params", {}), **kwargs.get("data", {})}
-                        kwargs["data"] = all_params
-                        if kwargs.get("params"): 
-                            del kwargs["params"]
-                    else:
-                        all_params = kwargs.get("params", {})
+                if endpoint in {"cancel_all", "leverage"} and self.account_id_value:
+                    body = kwargs.get("data") or {}
+                    if not isinstance(body, dict):
+                        body = {}
+                    body.setdefault("accountId", self.account_id_value)
+                    kwargs["data"] = body
 
-                    for k, v in self._build_signature(all_params, kwargs["method"]).items():
-                        if kwargs.get(k) is None:
-                            kwargs[k] = v
-                        else:
-                            kwargs[k].update(v)
+                if method in {"POST", "PUT", "DELETE"}:
+                    payload = kwargs.pop("data", None)
+                    if payload is not None:
+                        if not isinstance(payload, dict):
+                            raise ValueError(f"Request body must be a dict, got {type(payload)}")
+                        kwargs.setdefault("headers", {})
+                        kwargs["headers"].setdefault("Content-Type", "application/json")
+                        kwargs["json"] = payload
+                    kwargs.pop("params", None)
 
                 if current_host.host_header:
                     kwargs.setdefault("headers", {})
                     kwargs["headers"].setdefault("Host", current_host.host_header)
 
                 async with self.session.request(**kwargs) as response:
-                    data = await response.json()
-                    
-                    if 'code' in data and data['code'] != 200:
-                        if attempt < self.max_retries - 1:
-                            await asyncio.sleep(2 ** attempt)
-                            continue
-                        raise Exception(f"API Error: {data}")
-                    
-                    return data
-                    
+                    raw_text = await response.text()
+
+                    if response.status >= 400:
+                        raise Exception(
+                            f"HTTP {response.status} calling {kwargs.get('url')}: {raw_text or response.reason}"
+                        )
+
+                    if not raw_text:
+                        return {}
+
+                    content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
+                    if content_type and "json" not in content_type:
+                        raise Exception(
+                            f"Attempt to decode JSON with unexpected mimetype: {content_type}"
+                        )
+
+                    try:
+                        return await response.json()
+                    except Exception as exc:
+                        raise Exception(f"Failed to parse JSON response: {raw_text}") from exc
+
             except Exception as e:
                 if isinstance(e, (ClientConnectorError, ClientError, asyncio.TimeoutError)):
                     self._advance_base_url()
@@ -513,113 +525,110 @@ class Browser:
             method="GET",
             endpoint="exchange_info",
         )
-        if response.get("symbols") is None:
+        contracts = response.get("futureContracts")
+        if contracts is None:
             raise Exception(f'Failed to get tokens data: {response}')
-        return response["symbols"]
+        return contracts
 
     async def create_order(self, order_data: dict):
-        response = await self.send_request(
-            method="POST",
-            endpoint="order",
-            data=order_data,
-            build_signature=True,
-        )
-        if response.get("orderId") is None:
-            raise Exception(f'Failed to create order: {response}')
-        return response
+        raise NotImplementedError("Order placement requires Hibachi-specific signing and is not yet implemented")
 
     async def get_balance(self):
         response = await self.send_request(
             method="GET",
             endpoint="balance",
-            build_signature=True,
         )
-        if type(response) is not list:
+        balance_value = response.get("balance")
+        try:
+            return float(balance_value)
+        except (TypeError, ValueError):
             raise Exception(f'Failed to get balance: {response}')
-
-        return next((float(token["availableBalance"]) for token in response if token["asset"] == "USDT"), 0)
 
     async def get_token_price(self, token_name: str):
         response = await self.send_request(
             method="GET",
             endpoint="ticker_price",
-            params={"symbol": token_name + "USDT"},
+            params={"symbol": f"{token_name}/USDT-P"},
         )
-        if response.get("price") is None:
+        price = response.get("markPrice") or response.get("tradePrice")
+        if price is None:
             raise Exception(f'Failed to get {token_name} price: {response}')
 
-        return Decimal(response["price"])
+        return Decimal(price)
 
     async def get_leverages(self):
         response = await self.send_request(
             method="GET",
             endpoint="account",
-            build_signature=True,
         )
-        if response.get("positions") is None:
+        leverages = response.get("leverages")
+        if leverages is None:
             raise Exception(f'Failed to get leverages: {response}')
 
-        return {p["symbol"].removesuffix("USDT"): int(p["leverage"]) for p in response["positions"]}
+        result: dict[str, int] = {}
+        for entry in leverages:
+            symbol = entry.get("symbol")
+            rate = entry.get("initialMarginRate")
+            if not symbol or rate is None:
+                continue
+            try:
+                numeric_rate = float(rate)
+                leverage_value = max(int(round(1 / numeric_rate))) if numeric_rate else 1
+            except (TypeError, ValueError, ZeroDivisionError):
+                leverage_value = 1
+            result[symbol.replace("/USDT-P", "")] = max(leverage_value, 1)
+        return result
 
     async def change_leverage(self, token_name: str, leverage: int):
-        response = await self.send_request(
-            method="POST",
-            endpoint="leverage",
-            data={
-                "symbol": f"{token_name}USDT",
-                "leverage": leverage,
-            },
-            build_signature=True,
-        )
-        if response.get("leverage") != leverage:
-            raise Exception(f'Failed to change leverage: {response}')
-
-        return True
+        raise NotImplementedError("Leverage updates require Hibachi HMAC signing and are not yet implemented")
 
     async def get_account_positions(self):
         response = await self.send_request(
             method="GET",
             endpoint="position_risk",
-            build_signature=True,
         )
-        if type(response) is not list:
+        positions = response.get("positions")
+        if positions is None:
             raise Exception(f'Failed to get account positions: {response}')
 
-        return [p for p in response if Decimal(p["positionAmt"])]
+        normalized = []
+        for position in positions:
+            quantity = Decimal(str(position.get("quantity", "0")))
+            if not quantity:
+                continue
+            symbol = position.get("symbol", "")
+            normalized.append(
+                {
+                    "symbol": symbol.replace("/USDT-P", "USDT"),
+                    "positionAmt": str(quantity),
+                }
+            )
+        return normalized
 
     async def get_account_orders(self):
-        response = await self.send_request(
-            method="GET",
-            endpoint="open_orders",
-            build_signature=True,
-        )
-        if type(response) is not list:
-            raise Exception(f'Failed to get account orders: {response}')
-
-        return response
+        raise NotImplementedError("Open orders retrieval requires Hibachi trade endpoints that demand signing")
 
     async def close_all_open_orders(self, token_name: str):
-        response = await self.send_request(
-            method="DELETE",
-            endpoint="cancel_all",
-            params={"symbol": f"{token_name}USDT"},
-            build_signature=True,
-        )
-        if response != {'code': 200, 'msg': 'The operation of cancel all open order is done.'}:
-            raise Exception(f'Failed to close {token_name} orders: {response}')
-
-        return True
+        raise NotImplementedError("Cancelling orders requires Hibachi HMAC signing and nonce handling")
 
     async def get_token_order_book(self, token_name: str):
         response = await self.send_request(
             method="GET",
             endpoint="order_book",
-            params={"symbol": f"{token_name}USDT", "limit": 50},
+            params={"symbol": f"{token_name}/USDT-P", "depth": 5},
         )
-        if response.get("bids") is None or response.get("asks") is None:
+        bid = response.get("bid")
+        ask = response.get("ask")
+        if not bid or not ask:
             raise Exception(f'Failed to get {token_name} order book: {response}')
 
-        return {"BUY": float(response["bids"][0][0]), "SELL": float(response["asks"][0][0])}
+        def _first_price(side: dict) -> float:
+            levels = side.get("levels") or []
+            if not levels:
+                return 0.0
+            return float(levels[0].get("price", 0))
+
+        return {"BUY": _first_price(bid), "SELL": _first_price(ask)}
 
 
 class TradingBot:

@@ -127,15 +127,32 @@ class AsterClient:
         if self.TOKENS_DATA:
             return
 
-        for t in await self.browser.get_tokens_data():
-            token_name = t["baseAsset"]
-            formatted_filters = {f["filterType"]: f for f in t["filters"]}
+        for contract in await self.browser.get_tokens_data():
+            symbol = contract.get("symbol")
+            if not symbol or not symbol.endswith("/USDT-P"):
+                continue
+            token_name = symbol.split("/")[0]
 
-            price_decimal = count_digits(formatted_filters["PRICE_FILTER"]["tickSize"])
-            size_decimal = count_digits(
-                max(formatted_filters["MARKET_LOT_SIZE"]["minQty"], formatted_filters["LOT_SIZE"]["minQty"]))
+            def _decimals_from_step(value: str | None) -> int:
+                if not value:
+                    return 0
+                if value == "1":
+                    return 0
+                if "." in value:
+                    return len(value.split(".")[1].rstrip("0"))
+                return 0
 
-            self.TOKENS_DATA[token_name] = {"price": price_decimal, "size": size_decimal}
+            price_decimal = _decimals_from_step(contract.get("tickSize"))
+            size_decimal = _decimals_from_step(contract.get("stepSize"))
+
+            self.TOKENS_DATA[token_name] = {
+                "price": price_decimal,
+                "size": size_decimal,
+                "symbol": symbol,
+                "contract_id": contract.get("id"),
+                "underlying_decimals": contract.get("underlyingDecimals"),
+                "settlement_decimals": contract.get("settlementDecimals"),
+            }
 
 
     async def open_and_close_position(self, orders_type: str):
@@ -233,11 +250,19 @@ class AsterClient:
                     )
 
         if self.mode != 4 or CANCEL_ORDERS["orders"] or force_close:
-            open_orders = await self.browser.get_account_orders()
+            try:
+                open_orders = await self.browser.get_account_orders()
+            except NotImplementedError as exc:
+                self.log_message(str(exc), level="WARNING")
+                open_orders = []
+
             if open_orders:
                 self.log_message(f"Closing {len(open_orders)} open orders{additional_str}", level=level)
-                for token_name in list(set([o["symbol"].removesuffix("USDT") for o in open_orders])):
-                    await self.browser.close_all_open_orders(token_name=token_name)
+                for token_name in list({o["symbol"].replace("/USDT-P", "").removesuffix("USDT") for o in open_orders}):
+                    try:
+                        await self.browser.close_all_open_orders(token_name=token_name)
+                    except NotImplementedError as exc:
+                        self.log_message(str(exc), level="WARNING")
 
                 await self.db.append_report(
                     key=self.encoded_apikey,
@@ -300,8 +325,9 @@ class AsterClient:
 
         token_amount = float(round_cut(token_amount, self.TOKENS_DATA[token]["size"]))
 
+        order_symbol = self.TOKENS_DATA.get(token, {}).get("symbol", f"{token}/USDT-P")
         order_data = {
-            "symbol": f"{token}USDT",
+            "symbol": order_symbol,
             "side": side,
             "positionSide": "BOTH",
             "type": order_type,
@@ -328,6 +354,8 @@ class AsterClient:
 
         try:
             order_result = await self.browser.create_order(order_data)
+        except NotImplementedError as err:
+            raise Exception(str(err))
         except Exception as err:
             if self.group_number:
                 prefix = f"{self.label} | "
