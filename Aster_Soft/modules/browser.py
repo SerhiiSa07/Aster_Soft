@@ -1,6 +1,10 @@
 from dataclasses import dataclass  # HIBACHI-CHANGE: structure REST hosts with metadata
 from urllib.parse import urlencode, urlparse, urlunparse
-from aiohttp import ClientError, ClientSession, ClientConnectorError
+from aiohttp import ClientError, ClientSession, ClientConnectorError, TCPConnector
+try:  # HIBACHI-CHANGE: support custom DNS resolvers when aiohttp exposes them.
+    from aiohttp.resolver import AsyncResolver
+except Exception:  # pragma: no cover - AsyncResolver is optional in some aiohttp builds.
+    AsyncResolver = None
 from decimal import Decimal
 from hashlib import sha256
 from loguru import logger
@@ -40,6 +44,8 @@ DEFAULT_PROFILES = {
             "hibachi.finance",
             "hibachi.exchange",
         ],
+        # HIBACHI-CHANGE: use public DNS servers by default to avoid local resolver issues.
+        "dns_servers": ["1.1.1.1", "8.8.8.8"],
     },
 }
 
@@ -194,6 +200,7 @@ REFERER = EXCHANGE_CONFIG.get("referer")
 API_KEY_HEADER_NAME = EXCHANGE_CONFIG.get("api_key_header", DEFAULT_EXCHANGE_CONFIG["api_key_header"])
 ACCOUNT_HEADER_NAME = EXCHANGE_CONFIG.get("account_header")
 EXTRA_HEADERS = EXCHANGE_CONFIG.get("extra_headers", {})
+DNS_NAMESERVERS = EXCHANGE_CONFIG.get("dns_servers")
 
 DEFAULT_ENDPOINTS = {
     "time": "/fapi/v1/time",
@@ -290,7 +297,48 @@ class Browser:
 
     def get_new_session(self):
         # HIBACHI-CHANGE: trust environment variables so system-wide proxy or DNS settings apply.
+        connector = self._build_connector()
+        if connector is not None:
+            return ClientSession(headers=self._base_headers, trust_env=True, connector=connector)
         return ClientSession(headers=self._base_headers, trust_env=True)
+
+    def _build_connector(self) -> TCPConnector | None:
+        """HIBACHI-CHANGE: configure custom DNS servers for aiohttp if provided."""
+
+        dns_servers = DNS_NAMESERVERS
+        if AsyncResolver is None:
+            if dns_servers:
+                logger.opt(colors=True).warning(
+                    f"[!] <white>{self.label}</white> | AsyncResolver unavailable; cannot use custom DNS servers"
+                )
+            return None
+
+        if not isinstance(dns_servers, (list, tuple)):
+            return None
+
+        servers: list[str] = []
+        for server in dns_servers:
+            if server is None:
+                continue
+            cleaned = str(server).strip()
+            if cleaned:
+                servers.append(cleaned)
+
+        if not servers:
+            return None
+
+        try:
+            resolver = AsyncResolver(nameservers=servers)
+        except Exception as exc:  # pragma: no cover - depends on system resolver
+            logger.opt(colors=True).warning(
+                f"[!] <white>{self.label}</white> | Failed to initialise custom DNS resolver: {exc}"
+            )
+            return None
+
+        logger.opt(colors=True).debug(
+            f"[•] <white>{self.label}</white> | Using DNS servers <white>{', '.join(servers)}</white>"
+        )
+        return TCPConnector(resolver=resolver, ttl_dns_cache=300)
 
     async def close_session(self):
         if self.session:

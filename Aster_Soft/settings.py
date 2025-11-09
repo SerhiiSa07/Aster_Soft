@@ -23,6 +23,11 @@ EXCHANGE = {
         "hibachi.finance",
         "hibachi.exchange",
     ],
+    # HIBACHI-CHANGE: используем публичные DNS-серверы, если локальный резолвер не справляется.
+    "dns_servers": [
+        "1.1.1.1",
+        "8.8.8.8",
+    ],
 }
 
 SHUFFLE_WALLETS     = True
