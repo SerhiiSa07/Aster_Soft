@@ -5,6 +5,7 @@ try:  # HIBACHI-CHANGE: support custom DNS resolvers when aiohttp exposes them.
     from aiohttp.resolver import AsyncResolver
 except Exception:  # pragma: no cover - AsyncResolver is optional in some aiohttp builds.
     AsyncResolver = None
+_resolver_warning_logged = False  # HIBACHI-CHANGE: avoid spamming warnings when aiodns is missing.
 from decimal import Decimal
 from hashlib import sha256
 from loguru import logger
@@ -30,6 +31,7 @@ DEFAULT_PROFILES = {
         "origin": "https://www.asterdex.com",
         "referer": "https://www.asterdex.com/",
         "api_key_header": "X-MBX-APIKEY",
+        "fallback_prefixes": ["fapi"],
     },
     "hibachi": {
         "base_urls": ["https://api.hibachi.xyz", "https://hibachi.xyz", "https://www.hibachi.xyz"],
@@ -44,6 +46,7 @@ DEFAULT_PROFILES = {
             "hibachi.xyz",
             "hibachi.exchange",
         ],
+        "fallback_prefixes": ["api"],
         # HIBACHI-CHANGE: use public DNS servers by default to avoid local resolver issues.
         "dns_servers": ["1.1.1.1", "8.8.8.8"],
     },
@@ -104,13 +107,25 @@ def _generate_url_variants(url: str) -> list[str]:
 
     _add_variant(url)
 
-    hostname = parsed.netloc
-    if hostname.startswith("fapi."):
-        bare_domain = hostname[len("fapi."):]
+    hostname = parsed.hostname or ""
+    port_suffix = f":{parsed.port}" if parsed.port else ""
+    if hostname and "." in hostname:
+        bare_domain = hostname.split(".", 1)[1]
         if bare_domain:
-            _add_variant(urlunparse(parsed._replace(netloc=f"api.{bare_domain}")))
-            _add_variant(urlunparse(parsed._replace(netloc=bare_domain)))
-            _add_variant(urlunparse(parsed._replace(netloc=f"www.{bare_domain}")))
+            _add_variant(urlunparse(parsed._replace(netloc=f"{bare_domain}{port_suffix}")))
+            _add_variant(urlunparse(parsed._replace(netloc=f"www.{bare_domain}{port_suffix}")))
+
+            prefix = hostname.split(".", 1)[0]
+            alt_prefixes: list[str] = []
+            if prefix == "fapi":
+                alt_prefixes.append("api")
+            elif prefix == "api":
+                alt_prefixes.append("fapi")
+
+            for alt_prefix in alt_prefixes:
+                _add_variant(
+                    urlunparse(parsed._replace(netloc=f"{alt_prefix}.{bare_domain}{port_suffix}"))
+                )
 
     return variants
 
@@ -169,15 +184,25 @@ def _normalize_base_hosts(config: dict) -> list[RestHost]:
             parsed = urlparse(hosts[0].url)
             if parsed.scheme:
                 scheme_hint = parsed.scheme
+        fallback_prefixes = config.get("fallback_prefixes")
+        if isinstance(fallback_prefixes, str):
+            fallback_prefixes = [fallback_prefixes]
+        elif not isinstance(fallback_prefixes, (list, tuple)):
+            fallback_prefixes = [None]
+
         for domain in fallback_domains:
             if not isinstance(domain, str):
                 continue
             cleaned_domain = domain.strip().lstrip(".")
             if not cleaned_domain:
                 continue
-            primary_url = f"{scheme_hint}://fapi.{cleaned_domain}"
-            for variant in _generate_url_variants(primary_url):
-                hosts.append(RestHost(url=variant))
+            for prefix in fallback_prefixes:
+                if prefix:
+                    primary_url = f"{scheme_hint}://{prefix}.{cleaned_domain}"
+                else:
+                    primary_url = f"{scheme_hint}://{cleaned_domain}"
+                for variant in _generate_url_variants(primary_url):
+                    hosts.append(RestHost(url=variant))
 
     unique: list[RestHost] = []
     seen = set()
@@ -307,10 +332,12 @@ class Browser:
 
         dns_servers = DNS_NAMESERVERS
         if AsyncResolver is None:
-            if dns_servers:
-                logger.opt(colors=True).warning(
-                    f"[!] <white>{self.label}</white> | AsyncResolver unavailable; cannot use custom DNS servers"
+            global _resolver_warning_logged
+            if dns_servers and not _resolver_warning_logged:
+                logger.opt(colors=True).info(
+                    f"[•] <white>{self.label}</white> | aiohttp.AsyncResolver unavailable; install 'aiodns' to enable custom DNS"
                 )
+                _resolver_warning_logged = True
             return None
 
         if not isinstance(dns_servers, (list, tuple)):
