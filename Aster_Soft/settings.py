@@ -1,6 +1,11 @@
 EXCHANGE_PROFILE = "hibachi"  # Available profiles: "hibachi", "aster"
 EXCHANGE = {
-    # HIBACHI-CHANGE: set the live Hibachi REST endpoints and headers.
+    # HIBACHI-CHANGE: configure one or more Hibachi REST endpoints.
+    # If several URLs are provided the bot will try them in sequence on network errors.
+    "base_urls": [
+        "https://fapi.hibachi.finance",
+    ],
+    # The first URL in ``base_urls`` is also exposed as ``base_url`` for backward compatibility.
     "base_url": "https://fapi.hibachi.finance",
     "origin": "https://www.hibachi.finance",
     "referer": "https://www.hibachi.finance/",

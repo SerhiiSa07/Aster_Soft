@@ -1,5 +1,5 @@
 from urllib.parse import urlencode
-from aiohttp import ClientSession
+from aiohttp import ClientError, ClientSession, ClientConnectorError
 from decimal import Decimal
 from hashlib import sha256
 from loguru import logger
@@ -20,12 +20,14 @@ from modules.utils import parse_api_key, ParsedAPIKey  # HIBACHI-CHANGE: reuse H
 
 DEFAULT_PROFILES = {
     "aster": {
+        "base_urls": ["https://fapi.asterdex.com"],
         "base_url": "https://fapi.asterdex.com",
         "origin": "https://www.asterdex.com",
         "referer": "https://www.asterdex.com/",
         "api_key_header": "X-MBX-APIKEY",
     },
     "hibachi": {
+        "base_urls": ["https://fapi.hibachi.finance"],
         "base_url": "https://fapi.hibachi.finance",
         "origin": "https://www.hibachi.finance",
         "referer": "https://www.hibachi.finance/",
@@ -45,7 +47,39 @@ if PROFILE_KEY not in DEFAULT_PROFILES:
 DEFAULT_EXCHANGE_CONFIG = DEFAULT_PROFILES[PROFILE_KEY]
 
 EXCHANGE_CONFIG = {**DEFAULT_EXCHANGE_CONFIG, **(EXCHANGE or {})}
-BASE_URL = EXCHANGE_CONFIG.get("base_url", DEFAULT_EXCHANGE_CONFIG["base_url"]).rstrip('/')
+
+def _normalize_base_urls(config: dict) -> list[str]:
+    raw_urls = []
+    if "base_urls" in config and isinstance(config["base_urls"], (list, tuple)):
+        raw_urls.extend(config["base_urls"])
+    if config.get("base_url"):
+        raw_urls.append(config["base_url"])
+    if not raw_urls:
+        fallback = DEFAULT_EXCHANGE_CONFIG.get("base_url")
+        if fallback:
+            raw_urls.append(fallback)
+
+    normalized = []
+    for url in raw_urls:
+        if not isinstance(url, str):
+            continue
+        cleaned = url.strip()
+        if not cleaned:
+            continue
+        normalized.append(cleaned.rstrip('/'))
+
+    seen = set()
+    unique = []
+    for url in normalized:
+        if url not in seen:
+            seen.add(url)
+            unique.append(url)
+
+    return unique or ["https://fapi.hibachi.finance"]
+
+
+BASE_URLS = _normalize_base_urls(EXCHANGE_CONFIG)
+BASE_URL = BASE_URLS[0]
 ORIGIN = EXCHANGE_CONFIG.get("origin")
 REFERER = EXCHANGE_CONFIG.get("referer")
 API_KEY_HEADER_NAME = EXCHANGE_CONFIG.get("api_key_header", DEFAULT_EXCHANGE_CONFIG["api_key_header"])
@@ -71,6 +105,7 @@ ENDPOINTS = {**DEFAULT_ENDPOINTS, **EXCHANGE_CONFIG.get("endpoints", {})}
 
 class Browser:
     BASE_URL: str = BASE_URL
+    BASE_URLS: list[str] = BASE_URLS
     API_KEY_HEADER_NAME: str = API_KEY_HEADER_NAME
     ACCOUNT_HEADER_NAME: str | None = ACCOUNT_HEADER_NAME
     ORIGIN: str | None = ORIGIN
@@ -79,6 +114,10 @@ class Browser:
 
     def __init__(self, proxy: str, api_key: str, label: str, account_reference: str | None = None):
         self.max_retries = RETRY
+        self.base_urls = list(self.BASE_URLS)
+        if not self.base_urls:
+            self.base_urls = [BASE_URL]
+        self._base_url_index = 0
         self.api_key = api_key
         self.label = label
         self.endpoints = dict(self.ENDPOINTS)
@@ -111,11 +150,14 @@ class Browser:
             )
 
         if proxy not in ['https://log:pass@ip:port', 'http://log:pass@ip:port', 'log:pass@ip:port', '', None]:
-            self.proxy = "http://" + proxy.removeprefix("https://").removeprefix("http://")
-            logger.opt(colors=True).debug(f'[•] <white>{self.label}</white> | Got proxy <white>{self.proxy}</white>')
+            cleaned_proxy = proxy
+            if not proxy.startswith(("http://", "https://")):
+                cleaned_proxy = f"http://{proxy}"
+            self.proxy = cleaned_proxy
+            logger.opt(colors=True).debug(f'[•] <white>{self.label}</white> | Using proxy <white>{self.proxy}</white>')
         else:
             self.proxy = None
-            logger.opt(colors=True).warning(f'[-] <white>{self.label}</white> | Dont use proxies!')
+            logger.opt(colors=True).info(f'[•] <white>{self.label}</white> | Using direct connection (no proxy)')
 
         self.session = self.get_new_session()
 
@@ -170,11 +212,25 @@ class Browser:
                 )
         return secret.encode('utf-8')
 
+    def _current_base_url(self) -> str:
+        return self.base_urls[self._base_url_index]
+
+    def _advance_base_url(self) -> None:
+        if len(self.base_urls) <= 1:
+            return
+        previous = self._current_base_url()
+        self._base_url_index = (self._base_url_index + 1) % len(self.base_urls)
+        current = self._current_base_url()
+        if current != previous:
+            logger.opt(colors=True).warning(
+                f'[!] <white>{self.label}</white> | Switching REST host to <white>{current}</white>'
+            )
+
     def _build_url(self, endpoint_key: str) -> str:
         path = self.endpoints.get(endpoint_key)
         if path is None:
             raise ValueError(f"Unknown endpoint '{endpoint_key}'")
-        return f'{self.BASE_URL}{path}'
+        return f'{self._current_base_url()}{path}'
 
     def _build_signature(self, all_params: dict, method: str):
         query_string = urlencode(all_params)
@@ -198,10 +254,12 @@ class Browser:
             }
         }
 
-    async def send_request(self, **kwargs):
+    async def send_request(self, endpoint: str | None = None, **kwargs):
         for attempt in range(self.max_retries):
             try:
-                if kwargs.get("method"): 
+                if endpoint:
+                    kwargs["url"] = self._build_url(endpoint)
+                if kwargs.get("method"):
                     kwargs["method"] = kwargs["method"].upper()
                 if self.proxy:
                     kwargs["proxy"] = self.proxy
@@ -254,6 +312,8 @@ class Browser:
                     return data
                     
             except Exception as e:
+                if isinstance(e, (ClientConnectorError, ClientError, asyncio.TimeoutError)):
+                    self._advance_base_url()
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(2 ** attempt)
                     continue
@@ -262,7 +322,7 @@ class Browser:
     async def get_tokens_data(self):
         response = await self.send_request(
             method="GET",
-            url=self._build_url("exchange_info"),
+            endpoint="exchange_info",
         )
         if response.get("symbols") is None:
             raise Exception(f'Failed to get tokens data: {response}')
@@ -271,7 +331,7 @@ class Browser:
     async def create_order(self, order_data: dict):
         response = await self.send_request(
             method="POST",
-            url=self._build_url("order"),
+            endpoint="order",
             data=order_data,
             build_signature=True,
         )
@@ -282,7 +342,7 @@ class Browser:
     async def get_balance(self):
         response = await self.send_request(
             method="GET",
-            url=self._build_url("balance"),
+            endpoint="balance",
             build_signature=True,
         )
         if type(response) is not list:
@@ -293,7 +353,7 @@ class Browser:
     async def get_token_price(self, token_name: str):
         response = await self.send_request(
             method="GET",
-            url=self._build_url("ticker_price"),
+            endpoint="ticker_price",
             params={"symbol": token_name + "USDT"},
         )
         if response.get("price") is None:
@@ -304,7 +364,7 @@ class Browser:
     async def get_leverages(self):
         response = await self.send_request(
             method="GET",
-            url=self._build_url("account"),
+            endpoint="account",
             build_signature=True,
         )
         if response.get("positions") is None:
@@ -315,7 +375,7 @@ class Browser:
     async def change_leverage(self, token_name: str, leverage: int):
         response = await self.send_request(
             method="POST",
-            url=self._build_url("leverage"),
+            endpoint="leverage",
             data={
                 "symbol": f"{token_name}USDT",
                 "leverage": leverage,
@@ -330,7 +390,7 @@ class Browser:
     async def get_account_positions(self):
         response = await self.send_request(
             method="GET",
-            url=self._build_url("position_risk"),
+            endpoint="position_risk",
             build_signature=True,
         )
         if type(response) is not list:
@@ -341,7 +401,7 @@ class Browser:
     async def get_account_orders(self):
         response = await self.send_request(
             method="GET",
-            url=self._build_url("open_orders"),
+            endpoint="open_orders",
             build_signature=True,
         )
         if type(response) is not list:
@@ -352,7 +412,7 @@ class Browser:
     async def close_all_open_orders(self, token_name: str):
         response = await self.send_request(
             method="DELETE",
-            url=self._build_url("cancel_all"),
+            endpoint="cancel_all",
             params={"symbol": f"{token_name}USDT"},
             build_signature=True,
         )
@@ -364,7 +424,7 @@ class Browser:
     async def get_token_order_book(self, token_name: str):
         response = await self.send_request(
             method="GET",
-            url=self._build_url("order_book"),
+            endpoint="order_book",
             params={"symbol": f"{token_name}USDT", "limit": 50},
         )
         if response.get("bids") is None or response.get("asks") is None:
