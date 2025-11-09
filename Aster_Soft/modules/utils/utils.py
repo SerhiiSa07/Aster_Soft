@@ -167,11 +167,15 @@ def parse_api_key(raw_key: str, default_label: str) -> ParsedAPIKey:
         credential_parts = tuple(parts[-2:])
         label_parts = parts[:-2]
 
-    # HIBACHI-FORMAT: treat numeric prefixes as part of the account identifier
+    # HIBACHI-FORMAT: treat trailing numeric prefixes as part of the account identifier
     numeric_prefix: tuple[str, ...] = ()
-    if label_parts and all(part.isdigit() for part in label_parts):
-        numeric_prefix = tuple(label_parts)
-        label_parts = []
+    if label_parts:
+        split_point = len(label_parts)
+        while split_point > 0 and label_parts[split_point - 1].isdigit():
+            split_point -= 1
+        if split_point != len(label_parts):
+            numeric_prefix = tuple(label_parts[split_point:])
+            label_parts = label_parts[:split_point]
 
     if any(part == "" for part in credential_parts):
         raise ValueError(f"Unexpected API key format: {cleaned_key}")
