@@ -1,3 +1,4 @@
+from dataclasses import dataclass  # HIBACHI-CHANGE: structure REST hosts with metadata
 from urllib.parse import urlencode
 from aiohttp import ClientError, ClientSession, ClientConnectorError
 from decimal import Decimal
@@ -48,38 +49,95 @@ DEFAULT_EXCHANGE_CONFIG = DEFAULT_PROFILES[PROFILE_KEY]
 
 EXCHANGE_CONFIG = {**DEFAULT_EXCHANGE_CONFIG, **(EXCHANGE or {})}
 
-def _normalize_base_urls(config: dict) -> list[str]:
-    raw_urls = []
+
+@dataclass(frozen=True)
+class RestHost:
+    """Holds REST connection metadata for one Hibachi host."""
+
+    url: str
+    host_header: str | None = None
+    verify_ssl: bool | None = True
+
+
+def _as_bool(value, default: bool = True) -> bool:
+    """HIBACHI-CHANGE: interpret truthy/falsey flags from config safely."""
+
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+    return default
+
+
+def _normalize_base_hosts(config: dict) -> list[RestHost]:
+    raw_entries: list = []
     if "base_urls" in config and isinstance(config["base_urls"], (list, tuple)):
-        raw_urls.extend(config["base_urls"])
+        raw_entries.extend(config["base_urls"])
     if config.get("base_url"):
-        raw_urls.append(config["base_url"])
-    if not raw_urls:
+        raw_entries.append(config["base_url"])
+    if not raw_entries:
         fallback = DEFAULT_EXCHANGE_CONFIG.get("base_url")
         if fallback:
-            raw_urls.append(fallback)
+            raw_entries.append(fallback)
 
-    normalized = []
-    for url in raw_urls:
-        if not isinstance(url, str):
+    hosts: list[RestHost] = []
+    for entry in raw_entries:
+        if isinstance(entry, str):
+            cleaned = entry.strip()
+            if not cleaned:
+                continue
+            hosts.append(RestHost(url=cleaned.rstrip('/')))
             continue
-        cleaned = url.strip()
-        if not cleaned:
-            continue
-        normalized.append(cleaned.rstrip('/'))
 
+        if not isinstance(entry, dict):
+            continue
+
+        # HIBACHI-CHANGE: allow explicit host header and SSL toggle per entry.
+        url_value = entry.get("url") or entry.get("base_url") or entry.get("address")
+        if not isinstance(url_value, str):
+            continue
+
+        cleaned_url = url_value.strip()
+        if not cleaned_url:
+            continue
+
+        host_header = entry.get("host") or entry.get("host_header")
+        verify_ssl = entry.get("verify_ssl")
+        if verify_ssl is None:
+            verify_ssl = entry.get("ssl")
+
+        hosts.append(
+            RestHost(
+                url=cleaned_url.rstrip('/'),
+                host_header=host_header.strip() if isinstance(host_header, str) else None,
+                verify_ssl=_as_bool(verify_ssl, True),
+            )
+        )
+
+    unique: list[RestHost] = []
     seen = set()
-    unique = []
-    for url in normalized:
-        if url not in seen:
-            seen.add(url)
-            unique.append(url)
+    for host in hosts:
+        key = (host.url, host.host_header, host.verify_ssl)
+        if key not in seen:
+            seen.add(key)
+            unique.append(host)
 
-    return unique or ["https://fapi.hibachi.finance"]
+    if not unique:
+        return [RestHost(url="https://fapi.hibachi.finance")]
+
+    return unique
 
 
-BASE_URLS = _normalize_base_urls(EXCHANGE_CONFIG)
-BASE_URL = BASE_URLS[0]
+BASE_HOSTS = _normalize_base_hosts(EXCHANGE_CONFIG)
+BASE_URL = BASE_HOSTS[0].url
 ORIGIN = EXCHANGE_CONFIG.get("origin")
 REFERER = EXCHANGE_CONFIG.get("referer")
 API_KEY_HEADER_NAME = EXCHANGE_CONFIG.get("api_key_header", DEFAULT_EXCHANGE_CONFIG["api_key_header"])
@@ -105,7 +163,7 @@ ENDPOINTS = {**DEFAULT_ENDPOINTS, **EXCHANGE_CONFIG.get("endpoints", {})}
 
 class Browser:
     BASE_URL: str = BASE_URL
-    BASE_URLS: list[str] = BASE_URLS
+    BASE_HOSTS: list[RestHost] = BASE_HOSTS
     API_KEY_HEADER_NAME: str = API_KEY_HEADER_NAME
     ACCOUNT_HEADER_NAME: str | None = ACCOUNT_HEADER_NAME
     ORIGIN: str | None = ORIGIN
@@ -114,9 +172,9 @@ class Browser:
 
     def __init__(self, proxy: str, api_key: str, label: str, account_reference: str | None = None):
         self.max_retries = RETRY
-        self.base_urls = list(self.BASE_URLS)
-        if not self.base_urls:
-            self.base_urls = [BASE_URL]
+        self.base_hosts = list(self.BASE_HOSTS)
+        if not self.base_hosts:
+            self.base_hosts = [RestHost(url=BASE_URL)]
         self._base_url_index = 0
         self.api_key = api_key
         self.label = label
@@ -159,9 +217,10 @@ class Browser:
             self.proxy = None
             logger.opt(colors=True).info(f'[•] <white>{self.label}</white> | Using direct connection (no proxy)')
 
+        self._base_headers = self._build_base_headers()
         self.session = self.get_new_session()
 
-    def get_new_session(self):
+    def _build_base_headers(self) -> dict[str, str]:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
         }
@@ -171,8 +230,10 @@ class Browser:
             headers["Referer"] = self.REFERER
         if self.extra_headers:
             headers.update(self.extra_headers)
+        return headers
 
-        return ClientSession(headers=headers)
+    def get_new_session(self):
+        return ClientSession(headers=self._base_headers)
 
     async def close_session(self):
         if self.session:
@@ -212,25 +273,25 @@ class Browser:
                 )
         return secret.encode('utf-8')
 
-    def _current_base_url(self) -> str:
-        return self.base_urls[self._base_url_index]
+    def _current_host(self) -> RestHost:
+        return self.base_hosts[self._base_url_index]
 
     def _advance_base_url(self) -> None:
-        if len(self.base_urls) <= 1:
+        if len(self.base_hosts) <= 1:
             return
-        previous = self._current_base_url()
-        self._base_url_index = (self._base_url_index + 1) % len(self.base_urls)
-        current = self._current_base_url()
-        if current != previous:
+        previous = self._current_host()
+        self._base_url_index = (self._base_url_index + 1) % len(self.base_hosts)
+        current = self._current_host()
+        if current.url != previous.url:
             logger.opt(colors=True).warning(
-                f'[!] <white>{self.label}</white> | Switching REST host to <white>{current}</white>'
+                f'[!] <white>{self.label}</white> | Switching REST host to <white>{current.url}</white>'
             )
 
     def _build_url(self, endpoint_key: str) -> str:
         path = self.endpoints.get(endpoint_key)
         if path is None:
             raise ValueError(f"Unknown endpoint '{endpoint_key}'")
-        return f'{self._current_base_url()}{path}'
+        return f'{self._current_host().url}{path}'
 
     def _build_signature(self, all_params: dict, method: str):
         query_string = urlencode(all_params)
@@ -257,12 +318,15 @@ class Browser:
     async def send_request(self, endpoint: str | None = None, **kwargs):
         for attempt in range(self.max_retries):
             try:
+                current_host = self._current_host()
                 if endpoint:
                     kwargs["url"] = self._build_url(endpoint)
                 if kwargs.get("method"):
                     kwargs["method"] = kwargs["method"].upper()
                 if self.proxy:
                     kwargs["proxy"] = self.proxy
+                if current_host.verify_ssl is not None:
+                    kwargs.setdefault("ssl", current_host.verify_ssl)
 
                 if kwargs.get("build_signature"):
                     del kwargs["build_signature"]
@@ -299,6 +363,10 @@ class Browser:
                             kwargs[k] = v
                         else:
                             kwargs[k].update(v)
+
+                if current_host.host_header:
+                    kwargs.setdefault("headers", {})
+                    kwargs["headers"].setdefault("Host", current_host.host_header)
 
                 async with self.session.request(**kwargs) as response:
                     data = await response.json()
