@@ -9,7 +9,7 @@ _resolver_warning_logged = False  # HIBACHI-CHANGE: avoid spamming warnings when
 _resolver_failure_logged = False  # HIBACHI-CHANGE: only warn once if AsyncResolver init fails.
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from loguru import logger
-from time import time
+import time
 import hashlib
 import random
 import hmac
@@ -26,6 +26,17 @@ from settings import (
     EXCHANGE_PROFILE, EXCHANGE,
 )
 from modules.utils import parse_api_key, ParsedAPIKey  # HIBACHI-CHANGE: reuse Hibachi parser
+
+
+class HTTPStatusError(Exception):
+    """Raised when the exchange returns a non-success HTTP status code."""
+
+    def __init__(self, status: int, url: str | None, body: str | None):
+        self.status = status
+        self.url = url
+        self.body = body or ""
+        text = self.body
+        super().__init__(f"HTTP {status} calling {url}: {text}")
 
 DEFAULT_PROFILES = {
     "aster": {
@@ -220,6 +231,14 @@ ACCOUNT_HEADER_NAME = EXCHANGE_CONFIG.get("account_header")
 EXTRA_HEADERS = EXCHANGE_CONFIG.get("extra_headers", {})
 DNS_NAMESERVERS = EXCHANGE_CONFIG.get("dns_servers")
 
+
+def _current_time_microseconds() -> int:
+    """Return the current wall-clock time in microseconds."""
+
+    if hasattr(time, "time_ns"):
+        return time.time_ns() // 1_000
+    return int(time.time() * 1_000_000)
+
 DEFAULT_ENDPOINTS = {
     "time": {"path": "/exchange/utc-timestamp", "base": "data"},
     "exchange_info": {"path": "/market/exchange-info", "base": "data"},
@@ -316,6 +335,9 @@ class Browser:
         self._tokens_cache: list[dict] | None = None
         self._nonce_lock = asyncio.Lock()
         self._last_nonce: int = 0
+        self._nonce_seed_lock = asyncio.Lock()
+        self._nonce_seeded = False
+        self._nonce_sync_warned = False
 
     def _build_base_headers(self) -> dict[str, str]:
         headers = {
@@ -489,10 +511,38 @@ class Browser:
 
         return f"{self._current_host().url}{cleaned}"
 
+    async def _prime_nonce(self) -> None:
+        """Ensure the local nonce baseline is aligned with the exchange clock."""
+
+        async with self._nonce_seed_lock:
+            if self._nonce_seeded:
+                return
+            try:
+                response = await self.send_request(method="GET", endpoint="time")
+                timestamp_ms = (
+                    response.get("timestampMs")
+                    or response.get("timestamp_ms")
+                    or response.get("timestamp")
+                )
+                server_us = int(timestamp_ms) * 1_000 if timestamp_ms is not None else 0
+                if server_us > 0:
+                    async with self._nonce_lock:
+                        if server_us > self._last_nonce:
+                            self._last_nonce = server_us
+            except Exception as exc:  # pragma: no cover - networking dependent
+                if not self._nonce_sync_warned:
+                    logger.opt(colors=True).warning(
+                        f"[!] <white>{self.label}</white> | Failed to synchronise Hibachi time: {exc}"
+                    )
+                    self._nonce_sync_warned = True
+            finally:
+                self._nonce_seeded = True
+
     async def _generate_nonce(self) -> int:
         """HIBACHI-CHANGE: produce strictly increasing nonces for Hibachi signing."""
 
-        candidate = int(time() * 1_000_000)
+        await self._prime_nonce()
+        candidate = _current_time_microseconds()
         async with self._nonce_lock:
             if candidate <= self._last_nonce:
                 candidate = self._last_nonce + 1
@@ -674,8 +724,10 @@ class Browser:
                     raw_text = await response.text()
 
                     if response.status >= 400:
-                        raise Exception(
-                            f"HTTP {response.status} calling {kwargs.get('url')}: {raw_text or response.reason}"
+                        raise HTTPStatusError(
+                            response.status,
+                            kwargs.get("url"),
+                            raw_text or response.reason,
                         )
 
                     if not raw_text:
@@ -693,11 +745,18 @@ class Browser:
                         raise Exception(f"Failed to parse JSON response: {raw_text}") from exc
 
             except Exception as e:
+                if isinstance(e, HTTPStatusError):
+                    if 500 <= e.status < 600 and attempt < self.max_retries - 1:
+                        self._advance_base_url()
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    raise e
+
                 if isinstance(e, (ClientConnectorError, ClientError, asyncio.TimeoutError)):
-                    self._advance_base_url()
-                if attempt < self.max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
+                    if attempt < self.max_retries - 1:
+                        self._advance_base_url()
+                        await asyncio.sleep(2 ** attempt)
+                        continue
                 raise e
 
     async def get_tokens_data(self):
