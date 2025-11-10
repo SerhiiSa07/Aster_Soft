@@ -6,6 +6,7 @@ try:  # HIBACHI-CHANGE: support custom DNS resolvers when aiohttp exposes them.
 except Exception:  # pragma: no cover - AsyncResolver is optional in some aiohttp builds.
     AsyncResolver = None
 _resolver_warning_logged = False  # HIBACHI-CHANGE: avoid spamming warnings when aiodns is missing.
+_resolver_failure_logged = False  # HIBACHI-CHANGE: only warn once if AsyncResolver init fails.
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from loguru import logger
 from time import time
@@ -313,6 +314,8 @@ class Browser:
         self._contracts_by_symbol: dict[str, dict] = {}
         self._fee_config: dict = {}
         self._tokens_cache: list[dict] | None = None
+        self._nonce_lock = asyncio.Lock()
+        self._last_nonce: int = 0
 
     def _build_base_headers(self) -> dict[str, str]:
         headers = {
@@ -486,8 +489,15 @@ class Browser:
 
         return f"{self._current_host().url}{cleaned}"
 
-    def _generate_nonce(self) -> int:
-        return int(time() * 1_000_000)
+    async def _generate_nonce(self) -> int:
+        """HIBACHI-CHANGE: produce strictly increasing nonces for Hibachi signing."""
+
+        candidate = int(time() * 1_000_000)
+        async with self._nonce_lock:
+            if candidate <= self._last_nonce:
+                candidate = self._last_nonce + 1
+            self._last_nonce = candidate
+            return candidate
 
     def _build_connector(self) -> TCPConnector | None:
         """HIBACHI-CHANGE: configure custom DNS servers for aiohttp if provided."""
@@ -519,9 +529,12 @@ class Browser:
         try:
             resolver = AsyncResolver(nameservers=servers)
         except Exception as exc:  # pragma: no cover - depends on system resolver
-            logger.opt(colors=True).warning(
-                f"[!] <white>{self.label}</white> | Failed to initialise custom DNS resolver: {exc}"
-            )
+            global _resolver_failure_logged
+            if not _resolver_failure_logged:
+                logger.opt(colors=True).warning(
+                    f"[!] <white>{self.label}</white> | Failed to initialise custom DNS resolver: {exc}"
+                )
+                _resolver_failure_logged = True
             return None
 
         logger.opt(colors=True).debug(
@@ -761,7 +774,7 @@ class Browser:
         max_fee_units = int((max_fee_rate * (Decimal(10) ** 8)).to_integral_value(rounding=ROUND_HALF_UP))
         max_fee_str = f"{max_fee_rate:.8f}".rstrip("0").rstrip(".") or "0"
 
-        nonce = self._generate_nonce()
+        nonce = await self._generate_nonce()
 
         payload = (
             self._pack_uint(nonce, 8)
@@ -974,7 +987,7 @@ class Browser:
         if not account_id:
             raise Exception("Account identifier is required to cancel orders")
 
-        nonce = self._generate_nonce()
+        nonce = await self._generate_nonce()
         payload = self._pack_uint(nonce, 8)
         signature = self._sign_payload(payload)
 
