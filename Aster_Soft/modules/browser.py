@@ -403,7 +403,7 @@ class Browser:
             raise ValueError("Payload for signing cannot be empty")
         if isinstance(self.api_secret_raw, str) and self.api_secret_raw.startswith("0x"):
             digest = hashlib.sha256(payload).digest()
-            signed = Account.sign_hash(digest, private_key=self.api_secret_raw)
+            signed = Account.signHash(digest, private_key=self.api_secret_raw)
             signature_bytes = (
                 int(signed.r).to_bytes(32, "big")
                 + int(signed.s).to_bytes(32, "big")
