@@ -228,7 +228,13 @@ DEFAULT_ENDPOINTS = {
     "account": {"path": "/trade/account/info", "base": "trade"},
     "leverage": {"path": "/trade/account/leverage", "base": "trade"},
     "position_risk": {"path": "/trade/account/info", "base": "trade"},
-    "open_orders": {"path": "/trade/account/orders", "base": "trade"},
+    "open_orders": {
+        "paths": [
+            "/trade/account/orders",
+            "/trade/orders",
+        ],
+        "base": "trade",
+    },
     "cancel_all": {"path": "/trade/orders", "base": "trade"},
     "order_book": {"path": "/market/data/orderbook", "base": "data"},
 }
@@ -419,6 +425,65 @@ class Browser:
         if not normalized:
             return None
         return self._contracts_by_symbol.get(normalized)
+
+    def _open_orders_candidates(self) -> list[tuple[str, str]]:
+        """Return (base, path) tuples to query open orders, respecting overrides."""
+
+        spec = self.endpoints.get("open_orders")
+        base = "trade"
+        raw_candidates: list = []
+
+        def _append_path(value):
+            if isinstance(value, str):
+                cleaned = value.strip()
+                if cleaned:
+                    raw_candidates.append(cleaned)
+            elif isinstance(value, (list, tuple, set)):
+                for item in value:
+                    _append_path(item)
+
+        if isinstance(spec, dict):
+            base = spec.get("base", "trade") or "trade"
+            _append_path(spec.get("paths"))
+            _append_path(spec.get("path"))
+            _append_path(spec.get("url"))
+        elif isinstance(spec, (list, tuple, set)):
+            _append_path(spec)
+        elif isinstance(spec, str):
+            _append_path(spec)
+
+        if not raw_candidates:
+            raw_candidates = [
+                "/trade/account/orders",
+                "/trade/orders",
+            ]
+
+        seen: set[tuple[str, str]] = set()
+        result: list[tuple[str, str]] = []
+        for candidate in raw_candidates:
+            key = (base, candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append((base, candidate))
+
+        return result
+
+    def _resolve_base_url(self, base: str, path: str) -> str:
+        cleaned = path.strip()
+        if not cleaned:
+            raise ValueError("Open-orders endpoint path is empty")
+
+        if cleaned.startswith("http://") or cleaned.startswith("https://"):
+            return cleaned
+
+        if not cleaned.startswith("/"):
+            cleaned = f"/{cleaned}"
+
+        if base == "data":
+            return f"{DATA_BASE_URL}{cleaned}"
+
+        return f"{self._current_host().url}{cleaned}"
 
     def _generate_nonce(self) -> int:
         return int(time() * 1_000_000)
@@ -843,15 +908,63 @@ class Browser:
         return normalized
 
     async def get_account_orders(self):
-        response = await self.send_request(
-            method="GET",
-            endpoint="open_orders",
-        )
-        orders = response.get("orders") if isinstance(response, dict) else response
-        if orders is None:
-            return []
-        if isinstance(orders, list):
-            return orders
+        candidates = self._open_orders_candidates()
+        params: dict | None = None
+
+        account_id = self._account_id()
+        if account_id:
+            normalized = int(account_id) if str(account_id).isdigit() else account_id
+            params = {"accountId": normalized}
+
+        last_not_found: Exception | None = None
+
+        for base, path in candidates:
+            try:
+                url = self._resolve_base_url(base, path)
+            except ValueError as exc:
+                logger.opt(colors=True).debug(
+                    f"[•] <white>{self.label}</white> | Skipping invalid open-orders path <white>{path}</white>: {exc}"
+                )
+                continue
+
+            try:
+                response = await self.send_request(
+                    method="GET",
+                    endpoint=None,
+                    url=url,
+                    params=dict(params) if params else None,
+                )
+            except Exception as exc:
+                message = str(exc)
+                if "HTTP 404" in message or "Not Found" in message:
+                    last_not_found = exc
+                    continue
+                raise
+
+            if response is None:
+                return []
+
+            if isinstance(response, list):
+                return response
+
+            if isinstance(response, dict):
+                for key in ("orders", "data", "items"):
+                    value = response.get(key)
+                    if isinstance(value, list):
+                        return value
+                    if value is None:
+                        continue
+
+                if not response:
+                    return []
+
+            logger.opt(colors=True).debug(
+                f"[•] <white>{self.label}</white> | Unexpected open-orders payload from <white>{url}</white>: {response}"
+            )
+
+        if last_not_found is not None:
+            raise last_not_found
+
         return []
 
     async def close_all_open_orders(self, token_name: str):
