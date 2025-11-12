@@ -451,14 +451,11 @@ class Browser:
             signer = Account.from_key(self.api_secret_raw)
 
             # Hibachi expects ECDSA signatures over a keccak256 digest of the payload, matching
-            # the guidance from their documentation and the examples provided in the public SDKs.
+            # the guidance from їхньої документації. Використовуємо повний підпис, який повертає
+            # eth-account, щоб зберегти порядок байтів r|s|v без додаткових перетворень.
             digest = _keccak_hash(payload)
             signed = signer.signHash(digest)
-            signature_bytes = (
-                int(signed.r).to_bytes(32, "big")
-                + int(signed.s).to_bytes(32, "big")
-                + bytes([signed.v - 27])
-            )
+            signature_bytes = bytes(signed.signature)
             return signature_bytes.hex()
         return hmac.new(self.api_secret_bytes, payload, hashlib.sha256).hexdigest()
 
