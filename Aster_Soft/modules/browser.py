@@ -423,25 +423,13 @@ class Browser:
             raise ValueError("Value for signing must be non-negative")
         return int(value).to_bytes(length, "big", signed=False)
 
-    def _prepare_signature_digest(self, payload: bytes) -> bytes:
-        """Normalize an arbitrary-length payload into a 32-byte digest."""
-
+    def _sign_payload(self, payload: bytes) -> str:
         if not payload:
             raise ValueError("Payload for signing cannot be empty")
 
-        if len(payload) == 32:
-            return payload
-
-        if len(payload) < 32:
-            # Left-pad with zeros so the numeric value is preserved for big-endian signing.
-            return payload.rjust(32, b"\x00")
-
-        # Fallback to SHA-256 for unexpected over-length payloads (e.g. legacy formats).
-        return hashlib.sha256(payload).digest()
-
-    def _sign_payload(self, payload: bytes) -> str:
-        digest = self._prepare_signature_digest(payload)
         if isinstance(self.api_secret_raw, str) and self.api_secret_raw.startswith("0x"):
+            # Trustless Hibachi accounts expect the SHA-256 digest of the payload to be signed via ECDSA.
+            digest = hashlib.sha256(payload).digest()
             signer = Account.from_key(self.api_secret_raw)
             signed = signer.signHash(digest)
             signature_bytes = (
@@ -450,7 +438,7 @@ class Browser:
                 + bytes([signed.v - 27])
             )
             return signature_bytes.hex()
-        return hmac.new(self.api_secret_bytes, digest, hashlib.sha256).hexdigest()
+        return hmac.new(self.api_secret_bytes, payload, hashlib.sha256).hexdigest()
 
     def _account_id(self) -> str | None:
         return self.account_id_value or self.account_reference
