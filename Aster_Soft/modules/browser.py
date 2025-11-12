@@ -16,6 +16,20 @@ import hmac
 import asyncio
 
 from eth_account import Account
+try:  # HIBACHI-CHANGE: prefer eth_utils for canonical keccak hashing.
+    from eth_utils import keccak as _keccak_hash  # type: ignore
+except Exception:  # pragma: no cover - fallback to pysha3 if available.
+    _keccak_hash = None
+    try:
+        import sha3  # type: ignore
+
+        def _keccak_hash(value: bytes) -> bytes:
+            hasher = sha3.keccak_256()
+            hasher.update(value)
+            return hasher.digest()
+
+    except Exception:  # pragma: no cover - no keccak implementation available.
+        pass
 
 # Імпортуємо налаштування
 from settings import (
@@ -428,17 +442,17 @@ class Browser:
             raise ValueError("Payload for signing cannot be empty")
 
         if isinstance(self.api_secret_raw, str) and self.api_secret_raw.startswith("0x"):
+            if _keccak_hash is None:
+                raise RuntimeError(
+                    "Keccak hashing support is required for Hibachi trustless signatures. "
+                    "Install the 'eth-utils' or 'pysha3' package to continue."
+                )
+
             signer = Account.from_key(self.api_secret_raw)
 
-            # Hibachi returns the payload it verifies in error messages. When that payload is
-            # already 32 bytes (most trade digests), we sign it directly so the on-chain verifier
-            # sees the exact same digest. For longer payloads we fall back to SHA-256 hashing to
-            # keep support for capital endpoints that expect a hashed buffer.
-            if len(payload) == 32:
-                digest = payload
-            else:
-                digest = hashlib.sha256(payload).digest()
-
+            # Hibachi expects ECDSA signatures over a keccak256 digest of the payload, matching
+            # the guidance from their documentation and the examples provided in the public SDKs.
+            digest = _keccak_hash(payload)
             signed = signer.signHash(digest)
             signature_bytes = (
                 int(signed.r).to_bytes(32, "big")
