@@ -114,10 +114,17 @@ class AsterClient:
 
 
     async def change_leverage(self, token_name: str, leverage: int):
-        if self.leverages[token_name] != leverage:
-            await self.browser.change_leverage(token_name, leverage)
-            self.log_message(f"Changed leverage <white>{self.leverages[token_name]}x</white> → <white>{leverage}x</white>")
-            self.leverages[token_name] = leverage
+        current = self.leverages.get(token_name)
+        if current is None:
+            return
+
+        if current != leverage:
+            updated = await self.browser.change_leverage(token_name, leverage)
+            if updated:
+                self.log_message(
+                    f"Changed leverage <white>{current}x</white> → <white>{leverage}x</white>"
+                )
+                self.leverages[token_name] = leverage
 
 
     async def fetch_tokens_data(self):

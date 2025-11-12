@@ -428,9 +428,17 @@ class Browser:
             raise ValueError("Payload for signing cannot be empty")
 
         if isinstance(self.api_secret_raw, str) and self.api_secret_raw.startswith("0x"):
-            # Trustless Hibachi accounts expect the SHA-256 digest of the payload to be signed via ECDSA.
-            digest = hashlib.sha256(payload).digest()
             signer = Account.from_key(self.api_secret_raw)
+
+            # Hibachi returns the payload it verifies in error messages. When that payload is
+            # already 32 bytes (most trade digests), we sign it directly so the on-chain verifier
+            # sees the exact same digest. For longer payloads we fall back to SHA-256 hashing to
+            # keep support for capital endpoints that expect a hashed buffer.
+            if len(payload) == 32:
+                digest = payload
+            else:
+                digest = hashlib.sha256(payload).digest()
+
             signed = signer.signHash(digest)
             signature_bytes = (
                 int(signed.r).to_bytes(32, "big")
@@ -946,10 +954,11 @@ class Browser:
             result[symbol.replace("/USDT-P", "")] = max(leverage_value, 1)
         return result
 
-    async def change_leverage(self, token_name: str, leverage: int):
+    async def change_leverage(self, token_name: str, leverage: int) -> bool:
         logger.opt(colors=True).debug(
             f"[•] <white>{self.label}</white> | Skipping leverage update for <white>{token_name}</white> (Hibachi API not available)"
         )
+        return False
 
     async def get_account_positions(self):
         response = await self.send_request(
