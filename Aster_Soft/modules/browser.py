@@ -16,20 +16,6 @@ import hmac
 import asyncio
 
 from eth_account import Account
-try:  # HIBACHI-CHANGE: prefer eth_utils for canonical keccak hashing.
-    from eth_utils import keccak as _keccak_hash  # type: ignore
-except Exception:  # pragma: no cover - fallback to pysha3 if available.
-    _keccak_hash = None
-    try:
-        import sha3  # type: ignore
-
-        def _keccak_hash(value: bytes) -> bytes:
-            hasher = sha3.keccak_256()
-            hasher.update(value)
-            return hasher.digest()
-
-    except Exception:  # pragma: no cover - no keccak implementation available.
-        pass
 
 # Імпортуємо налаштування
 from settings import (
@@ -442,20 +428,18 @@ class Browser:
             raise ValueError("Payload for signing cannot be empty")
 
         if isinstance(self.api_secret_raw, str) and self.api_secret_raw.startswith("0x"):
-            if _keccak_hash is None:
-                raise RuntimeError(
-                    "Keccak hashing support is required for Hibachi trustless signatures. "
-                    "Install the 'eth-utils' or 'pysha3' package to continue."
-                )
-
             signer = Account.from_key(self.api_secret_raw)
 
-            # Hibachi expects ECDSA signatures over a keccak256 digest of the payload, matching
-            # the guidance from їхньої документації. Використовуємо повний підпис, який повертає
-            # eth-account, щоб зберегти порядок байтів r|s|v без додаткових перетворень.
-            digest = _keccak_hash(payload)
+            digest = hashlib.sha256(payload).digest()
             signed = signer.signHash(digest)
-            signature_bytes = bytes(signed.signature)
+            recovery = signed.v
+            if recovery >= 27:
+                recovery -= 27
+            signature_bytes = (
+                signed.r.to_bytes(32, "big")
+                + signed.s.to_bytes(32, "big")
+                + bytes([recovery])
+            )
             return signature_bytes.hex()
         return hmac.new(self.api_secret_bytes, payload, hashlib.sha256).hexdigest()
 
@@ -839,11 +823,25 @@ class Browser:
         side_value = "BID" if side_flag == "BUY" else "ASK"
         side_code = 1 if side_value == "BID" else 0
 
-        price_decimal = Decimal(str(order_data.get("price") if order_data.get("price") is not None else order_data.get("expected_price", 0)))
-        price_for_signature = price_decimal if order_type == "LIMIT" else Decimal("0")
-        price_units = int((price_for_signature * (Decimal(2) ** 32) * (Decimal(10) ** (underlying_decimals - settlement_decimals))).to_integral_value(rounding=ROUND_HALF_UP)) if price_for_signature else 0
-        if order_type == "LIMIT" and price_units <= 0:
-            raise Exception("Limit order price must be positive for Hibachi")
+        price_decimal = Decimal(
+            str(
+                order_data.get("price")
+                if order_data.get("price") is not None
+                else order_data.get("expected_price", 0)
+            )
+        )
+        price_units = 0
+        price_value = price_decimal
+        if order_type == "LIMIT":
+            price_value = self._quantize_decimal(price_decimal, price_precision)
+            price_multiplier = (Decimal(2) ** 32) * (Decimal(10) ** (settlement_decimals - underlying_decimals))
+            price_units = int(
+                (price_value * price_multiplier).to_integral_value(
+                    rounding=ROUND_HALF_UP
+                )
+            )
+            if price_units <= 0:
+                raise Exception("Limit order price must be positive for Hibachi")
 
         max_fee_rate = Decimal(str(
             (self._fee_config or {}).get("tradeTakerFeeRate")
@@ -887,7 +885,7 @@ class Browser:
         }
 
         if order_type == "LIMIT" and order_data.get("price") is not None:
-            body["price"] = self._format_decimal(price_decimal, price_precision)
+            body["price"] = self._format_decimal(price_value, price_precision)
 
         response = await self.send_request(
             method="POST",
