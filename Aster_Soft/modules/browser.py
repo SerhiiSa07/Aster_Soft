@@ -915,6 +915,45 @@ class Browser:
                 "cumQuote": str(fallback_price * executed_qty),
             }
 
+        fallback_price = Decimal(
+            str(
+                order_data.get("price")
+                if order_data.get("price") is not None
+                else order_data.get("expected_price")
+                or price_decimal
+                or "0"
+            )
+        )
+        if contract_info:
+            fallback_price = self._quantize_decimal(fallback_price, price_precision)
+
+        executed_qty_decimal = Decimal(str(order_snapshot.get("executedQty") or "0"))
+        if executed_qty_decimal == 0:
+            executed_qty_decimal = self._quantize_decimal(quantity_value, size_precision)
+            if executed_qty_decimal > 0:
+                order_snapshot["executedQty"] = (
+                    self._format_decimal(executed_qty_decimal, size_precision)
+                    if contract_info
+                    else str(executed_qty_decimal.normalize())
+                )
+
+        avg_price_decimal = Decimal(str(order_snapshot.get("avgPrice") or "0"))
+        if avg_price_decimal == 0 and fallback_price:
+            avg_price_decimal = fallback_price
+            order_snapshot["avgPrice"] = (
+                self._format_decimal(avg_price_decimal, price_precision)
+                if contract_info
+                else str(avg_price_decimal.normalize())
+            )
+
+        cum_quote_decimal = Decimal(str(order_snapshot.get("cumQuote") or "0"))
+        if cum_quote_decimal == 0 and avg_price_decimal and executed_qty_decimal:
+            cum_quote_decimal = avg_price_decimal * executed_qty_decimal
+            if settlement_decimals:
+                scale = Decimal(1).scaleb(-settlement_decimals)
+                cum_quote_decimal = cum_quote_decimal.quantize(scale, rounding=ROUND_HALF_UP)
+            order_snapshot["cumQuote"] = str(cum_quote_decimal)
+
         return order_snapshot
 
     async def get_balance(self):
