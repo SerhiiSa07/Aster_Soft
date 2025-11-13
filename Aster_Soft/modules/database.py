@@ -7,6 +7,7 @@ from loguru import logger
 from hashlib import md5
 import asyncio
 import json
+from decimal import Decimal
 
 from modules.retry import DataBaseError
 from modules.utils import WindowName, parse_api_key, ParsedAPIKey
@@ -436,16 +437,31 @@ class DataBase:
                 return len([module for module in modules_db[encoded_pk]["modules"] if module["status"] == "to_run"])
 
 
+    def _read_stats(self):
+        with open(self.stats_db_name, encoding="utf-8") as f:
+            stats_db = json.load(f)
+
+        if not isinstance(stats_db, dict):
+            stats_db = {}
+
+        stats_db.setdefault("modules_done", {})
+        stats_db.setdefault("profits", {})
+        return stats_db
+
+    def _write_stats(self, stats_db: dict):
+        with open(self.stats_db_name, 'w', encoding="utf-8") as f:
+            json.dump(stats_db, f)
+
     def set_accounts_modules_done(self, new_modules: dict):
-        with open(self.stats_db_name, encoding="utf-8") as f: stats_db = json.load(f)
+        stats_db = self._read_stats()
         stats_db["modules_done"] = {
             v["address"]: [0, len(v["modules"])]
             for k, v in new_modules.items()
         }
-        with open(self.stats_db_name, 'w', encoding="utf-8") as f: json.dump(stats_db, f)
+        self._write_stats(stats_db)
 
     def increase_account_modules_done(self, address: str):
-        with open(self.stats_db_name, encoding="utf-8") as f: stats_db = json.load(f)
+        stats_db = self._read_stats()
         modules_done = stats_db["modules_done"].get(address)
         if modules_done is None:
             return None
@@ -455,8 +471,22 @@ class DataBase:
         else:
             stats_db["modules_done"][address] = modules_done
 
-        with open(self.stats_db_name, 'w', encoding="utf-8") as f: json.dump(stats_db, f)
+        self._write_stats(stats_db)
         return modules_done
+
+    async def update_account_profit(self, address: str, profit: Decimal) -> Decimal:
+        async with self.lock:
+            stats_db = self._read_stats()
+            profits = stats_db.setdefault("profits", {})
+
+            current_total = Decimal(profits.get(address, "0"))
+            profit_value = Decimal(str(profit))
+            new_total = (current_total + profit_value).quantize(Decimal("0.001"))
+
+            profits[address] = format(new_total, 'f')
+            self._write_stats(stats_db)
+
+            return new_total
 
 
     async def append_report(self, key: str, text: str, success: bool | str = None, unique_msg: bool = False):
@@ -514,13 +544,34 @@ class DataBase:
 
             if report_db.get(key):
                 account_reports = report_db[key]
-                if get_rate: return f'{account_reports["success_rate"][0]}/{account_reports["success_rate"][1]}'
+                if get_rate:
+                    return f'{account_reports["success_rate"][0]}/{account_reports["success_rate"][1]}'
+
+                total_profit_line = ""
+                stats_db_to_write = None
+                if last_module and address:
+                    stats_db = self._read_stats()
+                    profits = stats_db.get("profits", {})
+                    total_profit_raw = profits.pop(address, None)
+                    if total_profit_raw is not None:
+                        stats_db_to_write = stats_db
+                        total_profit = Decimal(total_profit_raw).quantize(Decimal("0.001"))
+                        sign = "+" if total_profit >= 0 else ""
+                        profit_str = format(total_profit, 'f')
+                        total_profit_line = f"📊 <b>Total result {sign}{profit_str}$</b>"
+
                 del report_db[key]
 
-                with open(self.report_db_name, 'w', encoding="utf-8") as f: json.dump(report_db, f)
+                with open(self.report_db_name, 'w', encoding="utf-8") as f:
+                    json.dump(report_db, f)
+                if stats_db_to_write is not None:
+                    self._write_stats(stats_db_to_write)
 
                 logs_text = '\n'.join(account_reports['texts'])
-                tg_text = f'{header_string}{logs_text}'
+                if total_profit_line:
+                    logs_text = f"{logs_text}\n{total_profit_line}" if logs_text else total_profit_line
+
+                tg_text = f'{header_string}{logs_text}' if header_string or logs_text else ""
                 if account_reports["success_rate"][1]:
                     tg_text += f'\n\nSuccess rate {account_reports["success_rate"][0]}/{account_reports["success_rate"][1]}'
 

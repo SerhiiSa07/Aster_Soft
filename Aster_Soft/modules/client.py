@@ -211,6 +211,7 @@ class AsterClient:
             price_diff *= -1
         profit = round(Decimal(open_order_data["executedQty"]) * price_diff, 3)
         self.log_message(f"Profit: {profit}$", "+", "INFO")
+        await self.db.update_account_profit(address=self.address, profit=profit)
         await self.db.append_report(
             key=self.encoded_apikey,
             text=f'\n{self.prefix}💰 <b>profit {profit}$</b>',
